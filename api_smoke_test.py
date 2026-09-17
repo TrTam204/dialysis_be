@@ -5,12 +5,20 @@ resource, business-rule validations, nested vital signs, and dashboard stats.
 Run: python api_smoke_test.py
 """
 import json
+import os
 import time
 import urllib.error
 import urllib.request
 
 BASE = 'http://127.0.0.1:8000/api'
 PASSED, FAILED = [], []
+
+TEST_ADMIN_USERNAME = os.getenv('TEST_ADMIN_USERNAME', 'admin')
+TEST_ADMIN_PASSWORD = os.getenv('TEST_ADMIN_PASSWORD', 'admin123')
+TEST_DOCTOR_USERNAME = os.getenv('TEST_DOCTOR_USERNAME', 'doctor1')
+TEST_DOCTOR_PASSWORD = os.getenv('TEST_DOCTOR_PASSWORD', 'Doctor@123')
+TEST_NURSE_USERNAME = os.getenv('TEST_NURSE_USERNAME', 'nurse1')
+TEST_NURSE_PASSWORD = os.getenv('TEST_NURSE_PASSWORD', 'Nurse@123')
 
 
 def call(method, path, token=None, body=None):
@@ -66,9 +74,9 @@ def cleanup(admin_tok):
 
 
 print('== AUTH ==')
-admin_tok, admin_login = login('admin', 'admin123')
-doctor_tok, doctor_login = login('doctor1', 'Doctor@123')
-nurse_tok, nurse_login = login('nurse1', 'Nurse@123')
+admin_tok, admin_login = login(TEST_ADMIN_USERNAME, TEST_ADMIN_PASSWORD)
+doctor_tok, doctor_login = login(TEST_DOCTOR_USERNAME, TEST_DOCTOR_PASSWORD)
+nurse_tok, nurse_login = login(TEST_NURSE_USERNAME, TEST_NURSE_PASSWORD)
 cleanup(admin_tok)
 check('login returns user with department id int', isinstance(admin_login['user']['department'], int))
 check('login returns role', admin_login['user']['role'] == 'ADMIN')
