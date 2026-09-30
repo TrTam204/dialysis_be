@@ -186,6 +186,51 @@ def validate_session_data(attrs, instance=None):
         if overlapping.exists():
             errors['machine'] = ['This machine already has a session overlapping the selected time window.']
 
+    # State machine transition protection
+    if instance and 'status' in attrs:
+        old_status = instance.status
+        new_status = attrs['status']
+        if old_status != new_status:
+            ALLOWED_TRANSITIONS = {
+                DialysisSession.Status.SCHEDULED: {DialysisSession.Status.IN_PROGRESS, DialysisSession.Status.CANCELLED},
+                DialysisSession.Status.IN_PROGRESS: {DialysisSession.Status.COMPLETED, DialysisSession.Status.CANCELLED},
+                DialysisSession.Status.COMPLETED: set(),
+                DialysisSession.Status.CANCELLED: set(),
+            }
+            allowed = ALLOWED_TRANSITIONS.get(old_status, set())
+            if new_status not in allowed:
+                errors['status'] = [f'Invalid status transition from {old_status} to {new_status}.']
+
+    # Auto-stamp actual start/end on state transition if not provided
+    if attrs.get('status') == DialysisSession.Status.IN_PROGRESS:
+        if not attrs.get('actual_start') and (not instance or not instance.actual_start):
+            attrs['actual_start'] = dj_timezone.now()
+    elif attrs.get('status') == DialysisSession.Status.COMPLETED:
+        if not attrs.get('actual_end') and (not instance or not instance.actual_end):
+            attrs['actual_end'] = dj_timezone.now()
+
+    # Clinical fields validation (UF in Liters, weight in kg)
+    pre_weight = _merged(attrs, instance, 'pre_weight')
+    if pre_weight is not None and (pre_weight <= 0 or pre_weight > 300):
+        errors['pre_weight'] = ['Pre-dialysis weight must be between 0 and 300 kg.']
+
+    post_weight = _merged(attrs, instance, 'post_weight')
+    if post_weight is not None and (post_weight <= 0 or post_weight > 300):
+        errors['post_weight'] = ['Post-dialysis weight must be between 0 and 300 kg.']
+
+    uf_target = _merged(attrs, instance, 'uf_target')
+    if uf_target is not None and (uf_target < 0 or uf_target > 10):
+        errors['uf_target'] = ['UF target must be between 0 and 10 Liters.']
+
+    uf_actual = _merged(attrs, instance, 'uf_actual')
+    if uf_actual is not None and (uf_actual < 0 or uf_actual > 10):
+        errors['uf_actual'] = ['UF actual must be between 0 and 10 Liters.']
+
+    actual_start = _merged(attrs, instance, 'actual_start')
+    actual_end = _merged(attrs, instance, 'actual_end')
+    if actual_start and actual_end and actual_end <= actual_start:
+        errors['actual_end'] = ['actual_end must be after actual_start.']
+
     if errors:
         raise ValidationError(errors)
 

@@ -77,9 +77,21 @@ class IsNursePatientStatusOnly(permissions.BasePermission):
 
 
 class IsNurseAssignedSessionStatusOnly(permissions.BasePermission):
-    """NURSE may PATCH status only, and only on sessions assigned to them."""
+    """NURSE may PATCH status and clinical records only, on sessions assigned to them."""
 
-    message = 'NURSE may only update the status of sessions assigned to them.'
+    message = 'NURSE may only update status and clinical records of sessions assigned to them.'
+
+    ALLOWED_FIELDS = {
+        'status',
+        'actual_start',
+        'actual_end',
+        'pre_weight',
+        'post_weight',
+        'uf_target',
+        'uf_actual',
+        'clinical_notes',
+        'notes',
+    }
 
     def has_permission(self, request, view):
         user = request.user
@@ -88,7 +100,7 @@ class IsNurseAssignedSessionStatusOnly(permissions.BasePermission):
         if request.method != 'PATCH':
             return False
         data = request.data if isinstance(request.data, dict) else {}
-        return set(data.keys()) <= {'status'}
+        return set(data.keys()) <= self.ALLOWED_FIELDS
 
     def has_object_permission(self, request, view, obj):
         return obj.assigned_nurse_id == request.user.id

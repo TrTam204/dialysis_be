@@ -142,6 +142,7 @@ class DialysisSessionSerializer(serializers.ModelSerializer):
     patient_name = serializers.CharField(source='patient.full_name', read_only=True)
     patient_code = serializers.CharField(source='patient.patient_id', read_only=True)
     machine_name = serializers.CharField(source='machine.name', read_only=True)
+    patient_dry_weight = serializers.FloatField(source='patient.dry_weight', read_only=True)
     nurse_name = serializers.SerializerMethodField()
 
     class Meta:
@@ -151,12 +152,20 @@ class DialysisSessionSerializer(serializers.ModelSerializer):
             'patient',
             'patient_name',
             'patient_code',
+            'patient_dry_weight',
             'machine',
             'machine_name',
             'assigned_nurse',
             'nurse_name',
             'scheduled_start',
             'scheduled_end',
+            'actual_start',
+            'actual_end',
+            'pre_weight',
+            'post_weight',
+            'uf_target',
+            'uf_actual',
+            'clinical_notes',
             'pre_dialysis_bp',
             'during_dialysis_bp',
             'post_dialysis_bp',
