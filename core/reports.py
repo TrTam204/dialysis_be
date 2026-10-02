@@ -1,7 +1,6 @@
-from datetime import datetime, time, timedelta
+from datetime import datetime
 
 from django.db.models import Avg, Count, Q
-from django.utils import timezone as dj_timezone
 from rest_framework import permissions
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -103,7 +102,7 @@ class PatientReportView(APIView):
 
         return Response({
             'total_patients': Patient.objects.count(),
-            'treated_patients': len(treated_patient_ids),
+            'treated_patients': treated_patient_ids.count(),
             'status_breakdown': [
                 {'status': row['status'], 'count': row['count']} for row in status_rows
             ],
