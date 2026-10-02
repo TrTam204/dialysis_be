@@ -12,6 +12,11 @@ from .views import (
     dashboard_dialysis_stats_view,
     dashboard_machine_stats_view,
     dashboard_summary_view,
+    BloodSampleReportView,
+    MachineReportView,
+    NurseWorkloadReportView,
+    PatientReportView,
+    SessionReportView,
     report_machine_utilization_view,
     report_operational_summary_view,
 )
@@ -31,5 +36,10 @@ urlpatterns = [
     path('dashboard/machine-stats/', dashboard_machine_stats_view, name='dashboard-machine-stats'),
     path('reports/operational-summary/', report_operational_summary_view, name='report-operational-summary'),
     path('reports/machine-utilization/', report_machine_utilization_view, name='report-machine-utilization'),
+    path('reports/sessions/', SessionReportView.as_view(), name='reports-sessions'),
+    path('reports/patients/', PatientReportView.as_view(), name='reports-patients'),
+    path('reports/machines/', MachineReportView.as_view(), name='reports-machines'),
+    path('reports/nurse-workload/', NurseWorkloadReportView.as_view(), name='reports-nurse-workload'),
+    path('reports/blood-samples/', BloodSampleReportView.as_view(), name='reports-blood-samples'),
     path('', include(router.urls)),
 ]

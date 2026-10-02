@@ -39,6 +39,13 @@ from .services import (
     report_machine_utilization,
     report_operational_summary,
 )
+from .reports import (
+    BloodSampleReportView,
+    MachineReportView,
+    NurseWorkloadReportView,
+    PatientReportView,
+    SessionReportView,
+)
 
 
 class BaseRoleAwareViewSet(viewsets.ModelViewSet):
