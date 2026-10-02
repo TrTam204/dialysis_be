@@ -32,6 +32,13 @@ from .serializers import (
     VitalSignSerializer,
 )
 from .services import dashboard_dialysis_stats, dashboard_machine_stats, dashboard_summary
+from .reports import (
+    BloodSampleReportView,
+    MachineReportView,
+    NurseWorkloadReportView,
+    PatientReportView,
+    SessionReportView,
+)
 
 
 class BaseRoleAwareViewSet(viewsets.ModelViewSet):
