@@ -1,7 +1,15 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from django.core.cache import cache
-from django.db.models import Count
+from django.db.models import (
+    Count,
+    DurationField,
+    ExpressionWrapper,
+    F,
+    Q,
+    Sum,
+)
+from django.db.models.functions import TruncDate
 from django.utils import timezone as dj_timezone
 from django.utils.crypto import get_random_string
 from rest_framework import status
@@ -277,18 +285,75 @@ def dashboard_summary():
     }
 
 
-def dashboard_dialysis_stats(days=7):
+def parse_date_range(request, default_days=30):
+    date_from_raw = request.query_params.get('date_from')
+    date_to_raw = request.query_params.get('date_to')
     today = dj_timezone.localdate()
-    since = today - timedelta(days=days - 1)
-    # Group by local date in Python so the buckets match the server timezone.
-    counts = {}
-    sessions = DialysisSession.objects.filter(scheduled_start__date__gte=since).values_list('scheduled_start', flat=True)
-    for value in sessions:
-        day = dj_timezone.localtime(value).date() if dj_timezone.is_aware(value) else value.date()
-        counts[day] = counts.get(day, 0) + 1
+
+    date_from = None
+    date_to = None
+
+    if date_from_raw is not None and str(date_from_raw).strip() != '':
+        try:
+            date_from = datetime.strptime(str(date_from_raw).strip(), '%Y-%m-%d').date()
+        except ValueError:
+            return None, None, Response(
+                {'detail': 'Invalid date format for date_from. Expected YYYY-MM-DD.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    if date_to_raw is not None and str(date_to_raw).strip() != '':
+        try:
+            date_to = datetime.strptime(str(date_to_raw).strip(), '%Y-%m-%d').date()
+        except ValueError:
+            return None, None, Response(
+                {'detail': 'Invalid date format for date_to. Expected YYYY-MM-DD.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    if date_from is None and date_to is None:
+        date_to = today
+        date_from = today - timedelta(days=default_days - 1)
+    elif date_from is None:
+        date_from = date_to - timedelta(days=default_days - 1)
+    elif date_to is None:
+        date_to = today
+
+    if date_from > date_to:
+        return None, None, Response(
+            {'detail': 'date_from cannot be greater than date_to.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    return date_from, date_to, None
+
+
+def dashboard_dialysis_stats(days=7, date_from=None, date_to=None):
+    if date_from is not None and date_to is not None:
+        start_date = date_from
+        end_date = date_to
+    else:
+        end_date = dj_timezone.localdate()
+        start_date = end_date - timedelta(days=days - 1)
+
+    aggregated = (
+        DialysisSession.objects.filter(
+            scheduled_start__date__gte=start_date,
+            scheduled_start__date__lte=end_date,
+        )
+        .annotate(day=TruncDate('scheduled_start'))
+        .values('day')
+        .annotate(count=Count('session_id'))
+    )
+    counts = {row['day']: row['count'] for row in aggregated if row['day'] is not None}
+
+    total_days = (end_date - start_date).days + 1
     return [
-        {'date': (today - timedelta(days=offset)).isoformat(), 'count': counts.get(today - timedelta(days=offset), 0)}
-        for offset in range(days - 1, -1, -1)
+        {
+            'date': (start_date + timedelta(days=i)).isoformat(),
+            'count': counts.get(start_date + timedelta(days=i), 0),
+        }
+        for i in range(total_days)
     ]
 
 
@@ -299,3 +364,162 @@ def dashboard_machine_stats():
         .order_by('status')
     )
     return [{'status': row['status'], 'count': row['count']} for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Reports services (Milestone 7: Reports Aggregation)
+# ---------------------------------------------------------------------------
+
+def report_operational_summary(date_from, date_to):
+    sessions_qs = DialysisSession.objects.filter(
+        scheduled_start__date__gte=date_from,
+        scheduled_start__date__lte=date_to,
+    )
+
+    agg = sessions_qs.aggregate(
+        total_sessions=Count('session_id'),
+        completed_sessions=Count('session_id', filter=Q(status=DialysisSession.Status.COMPLETED)),
+        cancelled_sessions=Count('session_id', filter=Q(status=DialysisSession.Status.CANCELLED)),
+        scheduled_sessions=Count('session_id', filter=Q(status=DialysisSession.Status.SCHEDULED)),
+        in_progress_sessions=Count('session_id', filter=Q(status=DialysisSession.Status.IN_PROGRESS)),
+        total_uf_target=Sum('uf_target'),
+        total_uf_actual=Sum('uf_actual'),
+    )
+
+    total = agg['total_sessions'] or 0
+    completed = agg['completed_sessions'] or 0
+    cancelled = agg['cancelled_sessions'] or 0
+    scheduled = agg['scheduled_sessions'] or 0
+    in_progress = agg['in_progress_sessions'] or 0
+    completion_rate = round((completed / total) * 100.0, 2) if total > 0 else 0.0
+
+    raw_uf_target = agg['total_uf_target']
+    raw_uf_actual = agg['total_uf_actual']
+    total_uf_target = round(float(raw_uf_target), 2) if raw_uf_target is not None else 0.0
+    total_uf_actual = round(float(raw_uf_actual), 2) if raw_uf_actual is not None else 0.0
+
+    daily_rows = (
+        sessions_qs.annotate(date=TruncDate('scheduled_start'))
+        .values('date')
+        .annotate(
+            total=Count('session_id'),
+            completed=Count('session_id', filter=Q(status=DialysisSession.Status.COMPLETED)),
+            cancelled=Count('session_id', filter=Q(status=DialysisSession.Status.CANCELLED)),
+            scheduled=Count('session_id', filter=Q(status=DialysisSession.Status.SCHEDULED)),
+            in_progress=Count('session_id', filter=Q(status=DialysisSession.Status.IN_PROGRESS)),
+        )
+        .order_by('date')
+    )
+    daily_map = {row['date']: row for row in daily_rows if row['date'] is not None}
+    total_days = (date_to - date_from).days + 1
+    daily_trends = [
+        {
+            'date': (date_from + timedelta(days=i)).isoformat(),
+            'total': daily_map.get(date_from + timedelta(days=i), {}).get('total', 0),
+            'completed': daily_map.get(date_from + timedelta(days=i), {}).get('completed', 0),
+            'cancelled': daily_map.get(date_from + timedelta(days=i), {}).get('cancelled', 0),
+            'scheduled': daily_map.get(date_from + timedelta(days=i), {}).get('scheduled', 0),
+            'in_progress': daily_map.get(date_from + timedelta(days=i), {}).get('in_progress', 0),
+        }
+        for i in range(total_days)
+    ]
+
+    return {
+        'date_from': date_from.isoformat(),
+        'date_to': date_to.isoformat(),
+        'total_sessions': total,
+        'completed_sessions': completed,
+        'cancelled_sessions': cancelled,
+        'scheduled_sessions': scheduled,
+        'in_progress_sessions': in_progress,
+        'completion_rate': completion_rate,
+        'total_uf_target': total_uf_target,
+        'total_uf_actual': total_uf_actual,
+        'daily_trends': daily_trends,
+    }
+
+
+def report_machine_utilization(date_from, date_to):
+    machines_qs = (
+        DialysisMachine.objects.select_related('department')
+        .annotate(
+            session_count=Count(
+                'dialysis_sessions',
+                filter=Q(
+                    dialysis_sessions__scheduled_start__date__gte=date_from,
+                    dialysis_sessions__scheduled_start__date__lte=date_to,
+                ),
+            ),
+            completed_count=Count(
+                'dialysis_sessions',
+                filter=Q(
+                    dialysis_sessions__scheduled_start__date__gte=date_from,
+                    dialysis_sessions__scheduled_start__date__lte=date_to,
+                    dialysis_sessions__status=DialysisSession.Status.COMPLETED,
+                ),
+            ),
+            cancelled_count=Count(
+                'dialysis_sessions',
+                filter=Q(
+                    dialysis_sessions__scheduled_start__date__gte=date_from,
+                    dialysis_sessions__scheduled_start__date__lte=date_to,
+                    dialysis_sessions__status=DialysisSession.Status.CANCELLED,
+                ),
+            ),
+        )
+        .order_by('machine_id')
+    )
+
+    runtime_qs = (
+        DialysisSession.objects.filter(
+            scheduled_start__date__gte=date_from,
+            scheduled_start__date__lte=date_to,
+            status=DialysisSession.Status.COMPLETED,
+            actual_start__isnull=False,
+            actual_end__isnull=False,
+        )
+        .annotate(
+            duration=ExpressionWrapper(
+                F('actual_end') - F('actual_start'),
+                output_field=DurationField(),
+            )
+        )
+        .values('machine_id')
+        .annotate(total_duration=Sum('duration'))
+    )
+    runtime_map = {row['machine_id']: row['total_duration'] for row in runtime_qs}
+
+    machine_list = []
+    total_operating_seconds = 0.0
+    total_completed = 0
+
+    for m in machines_qs:
+        duration_td = runtime_map.get(m.machine_id)
+        seconds = duration_td.total_seconds() if duration_td is not None else 0.0
+        seconds = max(0.0, seconds)
+        total_operating_seconds += seconds
+        total_completed += m.completed_count
+
+        machine_list.append({
+            'machine_id': m.machine_id,
+            'name': m.name,
+            'status': m.status,
+            'department_id': m.department_id,
+            'department_name': m.department.name if m.department else None,
+            'last_maintenance_date': m.last_maintenance_date.isoformat() if m.last_maintenance_date else None,
+            'session_count': m.session_count,
+            'completed_count': m.completed_count,
+            'cancelled_count': m.cancelled_count,
+            'actual_runtime_hours': round(seconds / 3600.0, 2),
+            'actual_runtime_minutes': round(seconds / 60.0, 1),
+        })
+
+    return {
+        'date_from': date_from.isoformat(),
+        'date_to': date_to.isoformat(),
+        'limitation_note': 'Machine historical uptime/downtime percentage is not computed because status transition history logs are not tracked in the current database schema.',
+        'total_machines': len(machine_list),
+        'total_completed_sessions': total_completed,
+        'total_runtime_hours': round(total_operating_seconds / 3600.0, 2),
+        'machines': machine_list,
+    }

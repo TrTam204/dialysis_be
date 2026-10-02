@@ -12,6 +12,8 @@ from .views import (
     dashboard_dialysis_stats_view,
     dashboard_machine_stats_view,
     dashboard_summary_view,
+    report_machine_utilization_view,
+    report_operational_summary_view,
 )
 
 router = DefaultRouter()
@@ -27,5 +29,7 @@ urlpatterns = [
     path('dashboard/summary/', dashboard_summary_view, name='dashboard-summary'),
     path('dashboard/dialysis-stats/', dashboard_dialysis_stats_view, name='dashboard-dialysis-stats'),
     path('dashboard/machine-stats/', dashboard_machine_stats_view, name='dashboard-machine-stats'),
+    path('reports/operational-summary/', report_operational_summary_view, name='report-operational-summary'),
+    path('reports/machine-utilization/', report_machine_utilization_view, name='report-machine-utilization'),
     path('', include(router.urls)),
 ]

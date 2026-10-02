@@ -31,7 +31,14 @@ from .serializers import (
     PatientSerializer,
     VitalSignSerializer,
 )
-from .services import dashboard_dialysis_stats, dashboard_machine_stats, dashboard_summary
+from .services import (
+    dashboard_dialysis_stats,
+    dashboard_machine_stats,
+    dashboard_summary,
+    parse_date_range,
+    report_machine_utilization,
+    report_operational_summary,
+)
 
 
 class BaseRoleAwareViewSet(viewsets.ModelViewSet):
@@ -250,6 +257,14 @@ def dashboard_summary_view(request):
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def dashboard_dialysis_stats_view(request):
+    date_from_str = request.query_params.get('date_from')
+    date_to_str = request.query_params.get('date_to')
+    if date_from_str or date_to_str:
+        date_from, date_to, error_response = parse_date_range(request)
+        if error_response:
+            return error_response
+        return Response(dashboard_dialysis_stats(date_from=date_from, date_to=date_to))
+
     days = request.query_params.get('days', 7)
     try:
         days = max(1, min(90, int(days)))
@@ -262,3 +277,25 @@ def dashboard_dialysis_stats_view(request):
 @permission_classes([permissions.IsAuthenticated])
 def dashboard_machine_stats_view(request):
     return Response(dashboard_machine_stats())
+
+
+# ---------------------------------------------------------------------------
+# Reports API (Milestone 7: Reports & Analytics)
+# ---------------------------------------------------------------------------
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated, IsStaffMember])
+def report_operational_summary_view(request):
+    date_from, date_to, error_response = parse_date_range(request)
+    if error_response:
+        return error_response
+    return Response(report_operational_summary(date_from=date_from, date_to=date_to))
+
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated, IsStaffMember])
+def report_machine_utilization_view(request):
+    date_from, date_to, error_response = parse_date_range(request)
+    if error_response:
+        return error_response
+    return Response(report_machine_utilization(date_from=date_from, date_to=date_to))
