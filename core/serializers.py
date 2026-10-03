@@ -3,6 +3,7 @@ import json
 from rest_framework import serializers
 
 from .models import (
+    AuditLog,
     BloodSample,
     CustomUser,
     Department,
@@ -258,3 +259,26 @@ class VitalSignSerializer(serializers.ModelSerializer):
             attrs['session'] = session
         validate_vital_sign_data(attrs)
         return attrs
+
+
+class AuditLogSerializer(serializers.ModelSerializer):
+    actor_name = serializers.SerializerMethodField()
+    actor_role = serializers.CharField(source='actor.role', read_only=True, default=None)
+
+    class Meta:
+        model = AuditLog
+        fields = [
+            'id',
+            'actor',
+            'actor_name',
+            'actor_role',
+            'action',
+            'entity_type',
+            'entity_id',
+            'changes',
+            'timestamp',
+        ]
+        read_only_fields = fields
+
+    def get_actor_name(self, obj):
+        return _user_display(obj.actor)

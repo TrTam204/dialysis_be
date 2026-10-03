@@ -212,3 +212,37 @@ class VitalSign(models.Model):
 
     def __str__(self):
         return f'VitalSign for {self.session_id}'
+
+
+class AuditLog(models.Model):
+    class Action(models.TextChoices):
+        CREATE = 'CREATE', 'Create'
+        UPDATE = 'UPDATE', 'Update'
+        DELETE = 'DELETE', 'Delete'
+
+    actor = models.ForeignKey(
+        'CustomUser',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='audit_logs',
+    )
+    action = models.CharField(max_length=20, choices=Action.choices)
+    entity_type = models.CharField(max_length=50)
+    entity_id = models.CharField(max_length=64)
+    changes = models.JSONField(default=dict, blank=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-timestamp']
+        indexes = [
+            models.Index(fields=['entity_type'], name='idx_auditlog_entity_type'),
+            models.Index(fields=['action'], name='idx_auditlog_action'),
+            models.Index(fields=['timestamp'], name='idx_auditlog_timestamp'),
+            models.Index(fields=['entity_type', 'entity_id'], name='idx_auditlog_entity_lookup'),
+        ]
+
+    def __str__(self):
+        actor_name = self.actor.username if self.actor else 'System'
+        return f'[{self.timestamp:%Y-%m-%d %H:%M:%S}] {actor_name} {self.action} {self.entity_type}#{self.entity_id}'
+

@@ -1,3 +1,4 @@
+from django.db import transaction
 from django.db.models import ProtectedError
 from django.shortcuts import get_object_or_404
 from django_filters import rest_framework as django_filters
@@ -5,7 +6,9 @@ from rest_framework import filters, permissions, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 
+from .audit import AuditLogMixin, record_audit_log
 from .models import (
+    AuditLog,
     BloodSample,
     CustomUser,
     Department,
@@ -23,6 +26,7 @@ from .permissions import (
     IsStaffMember,
 )
 from .serializers import (
+    AuditLogSerializer,
     BloodSampleSerializer,
     CustomUserSerializer,
     DepartmentSerializer,
@@ -48,23 +52,12 @@ from .reports import (
 )
 
 
-class BaseRoleAwareViewSet(viewsets.ModelViewSet):
+class BaseRoleAwareViewSet(AuditLogMixin, viewsets.ModelViewSet):
     filter_backends = [
         django_filters.DjangoFilterBackend,
         filters.SearchFilter,
         filters.OrderingFilter,
     ]
-
-    def destroy(self, request, *args, **kwargs):
-        instance = self.get_object()
-        try:
-            self.perform_destroy(instance)
-        except ProtectedError:
-            return Response(
-                {'detail': 'Cannot delete this record because it is still referenced by other data.'},
-                status=400,
-            )
-        return Response(status=204)
 
 
 class DepartmentViewSet(BaseRoleAwareViewSet):
@@ -197,7 +190,9 @@ class DialysisSessionViewSet(BaseRoleAwareViewSet):
 
         serializer = VitalSignSerializer(data=request.data, context={'session': session, 'request': request})
         serializer.is_valid(raise_exception=True)
-        serializer.save(session=session, recorded_by=request.user)
+        with transaction.atomic():
+            vital = serializer.save(session=session, recorded_by=request.user)
+            record_audit_log(actor=request.user, action=AuditLog.Action.CREATE, instance=vital)
         return Response(serializer.data, status=201)
 
 
@@ -306,3 +301,32 @@ def report_machine_utilization_view(request):
     if error_response:
         return error_response
     return Response(report_machine_utilization(date_from=date_from, date_to=date_to))
+
+
+class AuditLogFilter(django_filters.FilterSet):
+    actor = django_filters.NumberFilter(field_name='actor__id')
+    actor_username = django_filters.CharFilter(field_name='actor__username', lookup_expr='icontains')
+    action = django_filters.ChoiceFilter(choices=AuditLog.Action.choices)
+    entity_type = django_filters.CharFilter(lookup_expr='iexact')
+    entity_id = django_filters.CharFilter(lookup_expr='iexact')
+    date_from = django_filters.DateTimeFilter(field_name='timestamp', lookup_expr='gte')
+    date_to = django_filters.DateTimeFilter(field_name='timestamp', lookup_expr='lte')
+
+    class Meta:
+        model = AuditLog
+        fields = ['actor', 'actor_username', 'action', 'entity_type', 'entity_id', 'date_from', 'date_to']
+
+
+class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = AuditLog.objects.select_related('actor').all().order_by('-timestamp')
+    serializer_class = AuditLogSerializer
+    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+    filter_backends = [
+        django_filters.DjangoFilterBackend,
+        filters.SearchFilter,
+        filters.OrderingFilter,
+    ]
+    filterset_class = AuditLogFilter
+    search_fields = ['entity_type', 'entity_id', 'actor__username', 'actor__first_name', 'actor__last_name']
+    ordering_fields = ['id', 'timestamp', 'entity_type', 'action']
+    ordering = ['-timestamp']

@@ -2,6 +2,7 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from .views import (
+    AuditLogViewSet,
     BloodSampleViewSet,
     CustomUserViewSet,
     DepartmentViewSet,
@@ -29,6 +30,7 @@ router.register(r'machines', DialysisMachineViewSet, basename='machine')
 router.register(r'sessions', DialysisSessionViewSet, basename='session')
 router.register(r'blood-samples', BloodSampleViewSet, basename='bloodsample')
 router.register(r'vital-signs', VitalSignViewSet, basename='vitalsign')
+router.register(r'audit-logs', AuditLogViewSet, basename='auditlog')
 
 urlpatterns = [
     path('dashboard/summary/', dashboard_summary_view, name='dashboard-summary'),
