@@ -17,7 +17,19 @@ from rest_framework.response import Response
 from rest_framework.serializers import ValidationError
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import BloodSample, CustomUser, DialysisMachine, DialysisSession, Patient
+from .models import (
+    AuditLog,
+    BloodSample,
+    CustomUser,
+    DialysisMachine,
+    DialysisSession,
+    Patient,
+    ScheduleAssignment,
+    SchedulePlan,
+    TreatmentPattern,
+)
+from .audit import record_audit_log
+from django.db import transaction
 
 
 # ---------------------------------------------------------------------------
@@ -523,3 +535,230 @@ def report_machine_utilization(date_from, date_to):
         'total_runtime_hours': round(total_operating_seconds / 3600.0, 2),
         'machines': machine_list,
     }
+
+
+# ---------------------------------------------------------------------------
+# Scheduling Approval & Lifecycle Services (Milestone 9 Phase 2)
+# ---------------------------------------------------------------------------
+
+def generate_dialysis_session_id(target_date) -> str:
+    """
+    Generate unique session_id adhering to SES-YYYYMMDD-XXXX format (17 chars <= 20).
+    """
+    if isinstance(target_date, datetime):
+        d = target_date.date()
+    else:
+        d = target_date
+    date_str = d.strftime('%Y%m%d')
+    prefix = f'SES-{date_str}-'
+
+    existing_ids = list(
+        DialysisSession.objects.filter(session_id__startswith=prefix).values_list('session_id', flat=True)
+    )
+    max_seq = 0
+    for sid in existing_ids:
+        suffix = sid[len(prefix):]
+        if suffix.isdigit():
+            max_seq = max(max_seq, int(suffix))
+
+    seq = max_seq + 1
+    while True:
+        candidate = f'{prefix}{seq:04d}'
+        if not DialysisSession.objects.filter(session_id=candidate).exists():
+            return candidate
+        seq += 1
+
+
+def validate_schedule_plan_for_approval(plan: SchedulePlan) -> dict:
+    """
+    Run mandatory 10-point validation before approving a SchedulePlan.
+    preferred_shift is treated as a SOFT CONSTRAINT (returns warnings, does not block).
+    """
+    errors = []
+    warnings = []
+
+    # 1. plan.status == PROPOSED
+    if plan.status != SchedulePlan.Status.PROPOSED:
+        errors.append(f'Only PROPOSED plans can be approved. Current status: {plan.status}.')
+
+    # 2. plan has at least 1 ScheduleAssignment
+    assignments = list(plan.assignments.select_related('patient', 'machine').all())
+    if not assignments:
+        errors.append('Plan has no schedule assignments to approve.')
+        return {'is_valid': False, 'errors': errors, 'warnings': warnings}
+
+    for asgn in assignments:
+        # 3. assignment.scheduled_date in [week_start, week_end]
+        if asgn.scheduled_date < plan.week_start or asgn.scheduled_date > plan.week_end:
+            errors.append(
+                f'Assignment for patient {asgn.patient_id} on {asgn.scheduled_date} is outside plan week [{plan.week_start}, {plan.week_end}].'
+            )
+
+        # 4. start_datetime < end_datetime
+        if asgn.start_datetime >= asgn.end_datetime:
+            errors.append(
+                f'Assignment for patient {asgn.patient_id} has invalid time window: start ({asgn.start_datetime}) must be before end ({asgn.end_datetime}).'
+            )
+
+        # 5. patient.status != DISCHARGED
+        if asgn.patient.status == Patient.Status.DISCHARGED:
+            errors.append(f'Patient {asgn.patient_id} is DISCHARGED and cannot be scheduled.')
+
+        # 6. patient.treatment_pattern is not NULL
+        if not asgn.patient.treatment_pattern:
+            errors.append(f'Patient {asgn.patient_id} does not have a treatment pattern configured.')
+        else:
+            # 7. scheduled_date conforms to treatment_pattern
+            # Monday=0, Tuesday=1, Wednesday=2, Thursday=3, Friday=4, Saturday=5, Sunday=6
+            weekday = asgn.scheduled_date.weekday()
+            if asgn.patient.treatment_pattern == TreatmentPattern.T2_T4_T6:
+                if weekday not in (0, 2, 4):
+                    errors.append(
+                        f'Scheduled date {asgn.scheduled_date} does not match patient {asgn.patient_id} treatment pattern (T2_T4_T6).'
+                    )
+            elif asgn.patient.treatment_pattern == TreatmentPattern.T3_T5_T7:
+                if weekday not in (1, 3, 5):
+                    errors.append(
+                        f'Scheduled date {asgn.scheduled_date} does not match patient {asgn.patient_id} treatment pattern (T3_T5_T7).'
+                    )
+
+        # 8. machine.status is not BROKEN or MAINTENANCE
+        if asgn.machine.status in ('BROKEN', 'MAINTENANCE'):
+            errors.append(f'Machine {asgn.machine_id} is in {asgn.machine.status} status and cannot be used.')
+
+        # 9. Overlap with existing DialysisSession of the same machine
+        mach_conflicts = DialysisSession.objects.filter(
+            machine=asgn.machine,
+            scheduled_start__lt=asgn.end_datetime,
+            scheduled_end__gt=asgn.start_datetime,
+        ).exclude(status=DialysisSession.Status.CANCELLED)
+        if mach_conflicts.exists():
+            conflict_session = mach_conflicts.first()
+            errors.append(
+                f'Machine {asgn.machine_id} has a conflicting DialysisSession ({conflict_session.session_id}) overlapping [{asgn.start_datetime}, {asgn.end_datetime}].'
+            )
+
+        # 10. Overlap with existing DialysisSession of the same patient
+        pat_conflicts = DialysisSession.objects.filter(
+            patient=asgn.patient,
+            scheduled_start__lt=asgn.end_datetime,
+            scheduled_end__gt=asgn.start_datetime,
+        ).exclude(status=DialysisSession.Status.CANCELLED)
+        if pat_conflicts.exists():
+            conflict_session = pat_conflicts.first()
+            errors.append(
+                f'Patient {asgn.patient_id} has a conflicting DialysisSession ({conflict_session.session_id}) overlapping [{asgn.start_datetime}, {asgn.end_datetime}].'
+            )
+
+        # Soft constraint: preferred_shift mismatch
+        if asgn.patient.preferred_shift and asgn.shift != asgn.patient.preferred_shift:
+            warnings.append(
+                f'Patient {asgn.patient_id} preferred shift is {asgn.patient.preferred_shift}, but scheduled for {asgn.shift} on {asgn.scheduled_date}.'
+            )
+
+    return {
+        'is_valid': len(errors) == 0,
+        'errors': errors,
+        'warnings': warnings,
+    }
+
+
+def approve_schedule_plan(plan_or_id, actor):
+    """
+    Approve a SchedulePlan within an atomic transaction.
+    Validates, generates unique DialysisSessions, links them via schedule_assignment,
+    updates plan status to APPROVED, and records comprehensive audit logs.
+    """
+    plan_id = plan_or_id.pk if hasattr(plan_or_id, 'pk') else plan_or_id
+
+    with transaction.atomic():
+        try:
+            plan = SchedulePlan.objects.select_for_update().get(pk=plan_id)
+        except SchedulePlan.DoesNotExist:
+            raise ValidationError({'detail': 'Schedule plan not found.'})
+
+        val_result = validate_schedule_plan_for_approval(plan)
+        if not val_result['is_valid']:
+            raise ValidationError({'errors': val_result['errors']})
+
+        created_sessions = []
+        for asgn in plan.assignments.select_related('patient', 'machine').all():
+            session_id = generate_dialysis_session_id(asgn.scheduled_date)
+            session = DialysisSession.objects.create(
+                session_id=session_id,
+                patient=asgn.patient,
+                machine=asgn.machine,
+                scheduled_start=asgn.start_datetime,
+                scheduled_end=asgn.end_datetime,
+                assigned_nurse=None,
+                schedule_assignment=asgn,
+                status=DialysisSession.Status.SCHEDULED,
+            )
+            created_sessions.append(session)
+            record_audit_log(
+                actor=actor,
+                action=AuditLog.Action.CREATE,
+                instance=session,
+                changes={
+                    'schedule_plan': plan.id,
+                    'schedule_assignment': asgn.id,
+                },
+            )
+
+        old_status = plan.status
+        plan.status = SchedulePlan.Status.APPROVED
+        plan.approved_by = actor
+        plan.approved_at = dj_timezone.now()
+        plan.save(update_fields=['status', 'approved_by', 'approved_at', 'updated_at'])
+
+        record_audit_log(
+            actor=actor,
+            action=AuditLog.Action.UPDATE,
+            instance=plan,
+            changes={
+                'status': {'before': old_status, 'after': SchedulePlan.Status.APPROVED},
+                'approved_by': actor.username,
+                'approved_at': plan.approved_at.isoformat(),
+                'created_sessions_count': len(created_sessions),
+            },
+        )
+
+        return plan, val_result['warnings'], created_sessions
+
+
+def reject_schedule_plan(plan_or_id, actor, reason: str):
+    """
+    Reject a SchedulePlan with an explicit reason.
+    Only PROPOSED plans can be rejected.
+    """
+    if not reason or not isinstance(reason, str) or not reason.strip():
+        raise ValidationError({'reason': ['Rejection reason is required and cannot be empty.']})
+    trimmed_reason = reason.strip()
+
+    plan_id = plan_or_id.pk if hasattr(plan_or_id, 'pk') else plan_or_id
+
+    with transaction.atomic():
+        try:
+            plan = SchedulePlan.objects.select_for_update().get(pk=plan_id)
+        except SchedulePlan.DoesNotExist:
+            raise ValidationError({'detail': 'Schedule plan not found.'})
+
+        if plan.status != SchedulePlan.Status.PROPOSED:
+            raise ValidationError({'status': [f'Only PROPOSED plans can be rejected. Current status: {plan.status}.']})
+
+        old_status = plan.status
+        plan.status = SchedulePlan.Status.REJECTED
+        plan.rejection_reason = trimmed_reason
+        plan.save(update_fields=['status', 'rejection_reason', 'updated_at'])
+
+        record_audit_log(
+            actor=actor,
+            action=AuditLog.Action.UPDATE,
+            instance=plan,
+            changes={
+                'status': {'before': old_status, 'after': SchedulePlan.Status.REJECTED},
+                'rejection_reason': trimmed_reason,
+            },
+        )
+
+        return plan

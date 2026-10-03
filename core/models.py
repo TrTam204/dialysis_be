@@ -183,6 +183,13 @@ class DialysisSession(models.Model):
         related_name='assigned_dialysis_sessions',
         limit_choices_to={'role': CustomUser.Role.NURSE},
     )
+    schedule_assignment = models.ForeignKey(
+        'ScheduleAssignment',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='dialysis_sessions',
+    )
     scheduled_start = models.DateTimeField()
     scheduled_end = models.DateTimeField()
     # Legacy summary fields kept per database-spec; VitalSign is the primary source now.
@@ -310,6 +317,10 @@ class SchedulePlan(models.Model):
         related_name='approved_schedule_plans',
     )
     approved_at = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.TextField(
+        null=True,
+        blank=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

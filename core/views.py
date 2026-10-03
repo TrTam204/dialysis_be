@@ -2,8 +2,9 @@ from django.db import transaction
 from django.db.models import ProtectedError
 from django.shortcuts import get_object_or_404
 from django_filters import rest_framework as django_filters
-from rest_framework import filters, permissions, viewsets
+from rest_framework import filters, permissions, status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 
 from .audit import AuditLogMixin, record_audit_log
@@ -40,10 +41,12 @@ from .serializers import (
     VitalSignSerializer,
 )
 from .services import (
+    approve_schedule_plan,
     dashboard_dialysis_stats,
     dashboard_machine_stats,
     dashboard_summary,
     parse_date_range,
+    reject_schedule_plan,
     report_machine_utilization,
     report_operational_summary,
 )
@@ -350,7 +353,7 @@ class SchedulePlanViewSet(BaseRoleAwareViewSet):
     ordering = ['-week_start']
 
     def get_permissions(self):
-        if self.action in {'create', 'update', 'partial_update'}:
+        if self.action in {'create', 'update', 'partial_update', 'approve', 'reject'}:
             self.permission_classes = [permissions.IsAuthenticated, IsAdminOrDoctor]
         elif self.action == 'destroy':
             self.permission_classes = [permissions.IsAuthenticated, IsAdmin]
@@ -360,6 +363,41 @@ class SchedulePlanViewSet(BaseRoleAwareViewSet):
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
+
+    @action(detail=True, methods=['post'], url_path='approve')
+    def approve(self, request, pk=None):
+        plan = self.get_object()
+        try:
+            approved_plan, warnings, sessions = approve_schedule_plan(plan.pk, request.user)
+            serializer = self.get_serializer(approved_plan)
+            return Response(
+                {
+                    'plan': serializer.data,
+                    'created_sessions_count': len(sessions),
+                    'warnings': warnings,
+                    'detail': 'Kế hoạch đã được phê duyệt thành công.',
+                },
+                status=status.HTTP_200_OK,
+            )
+        except ValidationError as e:
+            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], url_path='reject')
+    def reject(self, request, pk=None):
+        plan = self.get_object()
+        reason = request.data.get('reason', '')
+        try:
+            rejected_plan = reject_schedule_plan(plan.pk, request.user, reason)
+            serializer = self.get_serializer(rejected_plan)
+            return Response(
+                {
+                    'plan': serializer.data,
+                    'detail': 'Kế hoạch đã bị từ chối.',
+                },
+                status=status.HTTP_200_OK,
+            )
+        except ValidationError as e:
+            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
 
 
 class ScheduleAssignmentViewSet(BaseRoleAwareViewSet):

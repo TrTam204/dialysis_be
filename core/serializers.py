@@ -166,6 +166,7 @@ class DialysisSessionSerializer(serializers.ModelSerializer):
             'machine_name',
             'assigned_nurse',
             'nurse_name',
+            'schedule_assignment',
             'scheduled_start',
             'scheduled_end',
             'actual_start',
@@ -184,9 +185,11 @@ class DialysisSessionSerializer(serializers.ModelSerializer):
             'updated_at',
         ]
         # Legacy BP fields are kept read-only: VitalSign is the primary data source now.
+        # schedule_assignment is managed only through the approval workflow, not manual session API.
         read_only_fields = [
             'created_at',
             'updated_at',
+            'schedule_assignment',
             'pre_dialysis_bp',
             'during_dialysis_bp',
             'post_dialysis_bp',
@@ -315,14 +318,17 @@ class SchedulePlanSerializer(serializers.ModelSerializer):
             'approved_by',
             'approved_by_name',
             'approved_at',
+            'rejection_reason',
             'assignments_count',
             'created_at',
             'updated_at',
         ]
         read_only_fields = [
             'id',
+            'status',
             'approved_by',
             'approved_at',
+            'rejection_reason',
             'created_at',
             'updated_at',
             'assignments_count',
