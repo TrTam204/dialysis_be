@@ -10,6 +10,8 @@ from .models import (
     DialysisMachine,
     DialysisSession,
     Patient,
+    ScheduleAssignment,
+    SchedulePlan,
     VitalSign,
 )
 from .services import (
@@ -96,6 +98,8 @@ class PatientSerializer(serializers.ModelSerializer):
             'dry_weight',
             'location',
             'status',
+            'preferred_shift',
+            'treatment_pattern',
             'created_at',
             'updated_at',
         ]
@@ -139,7 +143,11 @@ class DialysisMachineSerializer(serializers.ModelSerializer):
 class DialysisSessionSerializer(serializers.ModelSerializer):
     patient = serializers.PrimaryKeyRelatedField(queryset=Patient.objects.all())
     machine = serializers.PrimaryKeyRelatedField(queryset=DialysisMachine.objects.all())
-    assigned_nurse = serializers.PrimaryKeyRelatedField(queryset=CustomUser.objects.filter(role=CustomUser.Role.NURSE))
+    assigned_nurse = serializers.PrimaryKeyRelatedField(
+        queryset=CustomUser.objects.filter(role=CustomUser.Role.NURSE),
+        required=False,
+        allow_null=True,
+    )
     patient_name = serializers.CharField(source='patient.full_name', read_only=True)
     patient_code = serializers.CharField(source='patient.patient_id', read_only=True)
     machine_name = serializers.CharField(source='machine.name', read_only=True)
@@ -282,3 +290,108 @@ class AuditLogSerializer(serializers.ModelSerializer):
 
     def get_actor_name(self, obj):
         return _user_display(obj.actor)
+
+
+class SchedulePlanSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.SerializerMethodField()
+    approved_by_name = serializers.SerializerMethodField()
+    department_name = serializers.CharField(source='department.name', read_only=True)
+    assignments_count = serializers.IntegerField(source='assignments.count', read_only=True)
+
+    class Meta:
+        model = SchedulePlan
+        fields = [
+            'id',
+            'name',
+            'department',
+            'department_name',
+            'week_start',
+            'week_end',
+            'status',
+            'fitness_score',
+            'algorithm_metadata',
+            'created_by',
+            'created_by_name',
+            'approved_by',
+            'approved_by_name',
+            'approved_at',
+            'assignments_count',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = [
+            'id',
+            'approved_by',
+            'approved_at',
+            'created_at',
+            'updated_at',
+            'assignments_count',
+        ]
+
+    def get_created_by_name(self, obj):
+        return _user_display(obj.created_by)
+
+    def get_approved_by_name(self, obj):
+        return _user_display(obj.approved_by)
+
+    def validate(self, attrs):
+        week_start = attrs.get('week_start') or getattr(self.instance, 'week_start', None)
+        week_end = attrs.get('week_end') or getattr(self.instance, 'week_end', None)
+        if week_start and week_end and week_end < week_start:
+            raise serializers.ValidationError({'week_end': ['week_end must be on or after week_start.']})
+        return attrs
+
+
+class ScheduleAssignmentSerializer(serializers.ModelSerializer):
+    patient_name = serializers.CharField(source='patient.full_name', read_only=True)
+    patient_code = serializers.CharField(source='patient.patient_id', read_only=True)
+    machine_name = serializers.CharField(source='machine.name', read_only=True)
+
+    class Meta:
+        model = ScheduleAssignment
+        fields = [
+            'id',
+            'schedule_plan',
+            'patient',
+            'patient_name',
+            'patient_code',
+            'machine',
+            'machine_name',
+            'scheduled_date',
+            'shift',
+            'start_datetime',
+            'end_datetime',
+            'source',
+            'original_machine',
+            'original_shift',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate(self, attrs):
+        start_datetime = attrs.get('start_datetime') or getattr(self.instance, 'start_datetime', None)
+        end_datetime = attrs.get('end_datetime') or getattr(self.instance, 'end_datetime', None)
+        if start_datetime and end_datetime and end_datetime <= start_datetime:
+            raise serializers.ValidationError({'end_datetime': ['end_datetime must be after start_datetime.']})
+
+        # When updating: if machine or shift changed, mark source as MANUAL
+        if self.instance is not None:
+            new_machine = attrs.get('machine')
+            new_shift = attrs.get('shift')
+            if (new_machine and new_machine != self.instance.machine) or (new_shift and new_shift != self.instance.shift):
+                attrs['source'] = ScheduleAssignment.Source.MANUAL
+
+            # original_machine and original_shift are IMMUTABLE once created
+            if 'original_machine' in attrs and attrs['original_machine'] != self.instance.original_machine:
+                attrs.pop('original_machine')
+            if 'original_shift' in attrs and attrs['original_shift'] != self.instance.original_shift:
+                attrs.pop('original_shift')
+        else:
+            # On creation: default original_machine/shift from initial machine/shift
+            if 'original_machine' not in attrs:
+                attrs['original_machine'] = attrs.get('machine')
+            if 'original_shift' not in attrs:
+                attrs['original_shift'] = attrs.get('shift')
+
+        return attrs

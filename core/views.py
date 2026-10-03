@@ -15,6 +15,8 @@ from .models import (
     DialysisMachine,
     DialysisSession,
     Patient,
+    ScheduleAssignment,
+    SchedulePlan,
     VitalSign,
 )
 from .permissions import (
@@ -33,6 +35,8 @@ from .serializers import (
     DialysisMachineSerializer,
     DialysisSessionSerializer,
     PatientSerializer,
+    ScheduleAssignmentSerializer,
+    SchedulePlanSerializer,
     VitalSignSerializer,
 )
 from .services import (
@@ -330,3 +334,56 @@ class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
     search_fields = ['entity_type', 'entity_id', 'actor__username', 'actor__first_name', 'actor__last_name']
     ordering_fields = ['id', 'timestamp', 'entity_type', 'action']
     ordering = ['-timestamp']
+
+
+class SchedulePlanViewSet(BaseRoleAwareViewSet):
+    queryset = (
+        SchedulePlan.objects.select_related('department', 'created_by', 'approved_by')
+        .prefetch_related('assignments')
+        .all()
+        .order_by('-week_start', '-created_at')
+    )
+    serializer_class = SchedulePlanSerializer
+    filterset_fields = ['department', 'week_start', 'status']
+    search_fields = ['name']
+    ordering_fields = ['id', 'week_start', 'week_end', 'status', 'created_at']
+    ordering = ['-week_start']
+
+    def get_permissions(self):
+        if self.action in {'create', 'update', 'partial_update'}:
+            self.permission_classes = [permissions.IsAuthenticated, IsAdminOrDoctor]
+        elif self.action == 'destroy':
+            self.permission_classes = [permissions.IsAuthenticated, IsAdmin]
+        else:
+            self.permission_classes = [permissions.IsAuthenticated, IsStaffMember]
+        return super().get_permissions()
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+
+class ScheduleAssignmentViewSet(BaseRoleAwareViewSet):
+    queryset = (
+        ScheduleAssignment.objects.select_related(
+            'schedule_plan',
+            'patient',
+            'machine',
+            'original_machine',
+        )
+        .all()
+        .order_by('scheduled_date', 'shift')
+    )
+    serializer_class = ScheduleAssignmentSerializer
+    filterset_fields = ['schedule_plan', 'patient', 'machine', 'scheduled_date', 'shift', 'source']
+    search_fields = ['patient__full_name', 'patient__patient_id', 'machine__name']
+    ordering_fields = ['id', 'scheduled_date', 'shift', 'created_at']
+    ordering = ['scheduled_date', 'shift']
+
+    def get_permissions(self):
+        if self.action in {'create', 'update', 'partial_update'}:
+            self.permission_classes = [permissions.IsAuthenticated, IsAdminOrDoctor]
+        elif self.action == 'destroy':
+            self.permission_classes = [permissions.IsAuthenticated, IsAdmin]
+        else:
+            self.permission_classes = [permissions.IsAuthenticated, IsStaffMember]
+        return super().get_permissions()

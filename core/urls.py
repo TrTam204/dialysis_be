@@ -9,6 +9,8 @@ from .views import (
     DialysisMachineViewSet,
     DialysisSessionViewSet,
     PatientViewSet,
+    ScheduleAssignmentViewSet,
+    SchedulePlanViewSet,
     VitalSignViewSet,
     dashboard_dialysis_stats_view,
     dashboard_machine_stats_view,
@@ -31,6 +33,8 @@ router.register(r'sessions', DialysisSessionViewSet, basename='session')
 router.register(r'blood-samples', BloodSampleViewSet, basename='bloodsample')
 router.register(r'vital-signs', VitalSignViewSet, basename='vitalsign')
 router.register(r'audit-logs', AuditLogViewSet, basename='auditlog')
+router.register(r'schedule-plans', SchedulePlanViewSet, basename='scheduleplan')
+router.register(r'schedule-assignments', ScheduleAssignmentViewSet, basename='scheduleassignment')
 
 urlpatterns = [
     path('dashboard/summary/', dashboard_summary_view, name='dashboard-summary'),

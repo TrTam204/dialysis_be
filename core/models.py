@@ -24,6 +24,17 @@ class Department(models.Model):
         return f'{self.code} - {self.name}'
 
 
+class Shift(models.TextChoices):
+    SHIFT_1 = 'SHIFT_1', 'Ca 1'
+    SHIFT_2 = 'SHIFT_2', 'Ca 2'
+    SHIFT_3 = 'SHIFT_3', 'Ca 3'
+
+
+class TreatmentPattern(models.TextChoices):
+    T2_T4_T6 = 'T2_T4_T6', 'Thứ 2 - Thứ 4 - Thứ 6'
+    T3_T5_T7 = 'T3_T5_T7', 'Thứ 3 - Thứ 5 - Thứ 7'
+
+
 class Patient(models.Model):
     class Status(models.TextChoices):
         ACTIVE = 'ACTIVE', 'Active'
@@ -40,6 +51,20 @@ class Patient(models.Model):
     dry_weight = models.FloatField(blank=True, null=True)
     location = models.PointField(srid=4326, blank=True, null=True)
     status = models.CharField(max_length=20, choices=Status.choices, default='ACTIVE')
+    preferred_shift = models.CharField(
+        max_length=20,
+        choices=Shift.choices,
+        null=True,
+        blank=True,
+        default=None,
+    )
+    treatment_pattern = models.CharField(
+        max_length=20,
+        choices=TreatmentPattern.choices,
+        null=True,
+        blank=True,
+        default=None,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -153,6 +178,8 @@ class DialysisSession(models.Model):
     assigned_nurse = models.ForeignKey(
         'CustomUser',
         on_delete=models.PROTECT,
+        null=True,
+        blank=True,
         related_name='assigned_dialysis_sessions',
         limit_choices_to={'role': CustomUser.Role.NURSE},
     )
@@ -245,4 +272,132 @@ class AuditLog(models.Model):
     def __str__(self):
         actor_name = self.actor.username if self.actor else 'System'
         return f'[{self.timestamp:%Y-%m-%d %H:%M:%S}] {actor_name} {self.action} {self.entity_type}#{self.entity_id}'
+
+
+class SchedulePlan(models.Model):
+    class Status(models.TextChoices):
+        PROPOSED = 'PROPOSED', 'Proposed'
+        APPROVED = 'APPROVED', 'Approved'
+        REJECTED = 'REJECTED', 'Rejected'
+
+    name = models.CharField(max_length=120, blank=True, default='')
+    department = models.ForeignKey(
+        Department,
+        on_delete=models.PROTECT,
+        related_name='schedule_plans',
+    )
+    week_start = models.DateField()
+    week_end = models.DateField()
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.PROPOSED,
+    )
+    fitness_score = models.FloatField(null=True, blank=True)
+    algorithm_metadata = models.JSONField(default=dict, blank=True)
+    created_by = models.ForeignKey(
+        'CustomUser',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='created_schedule_plans',
+    )
+    approved_by = models.ForeignKey(
+        'CustomUser',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='approved_schedule_plans',
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-week_start', '-created_at']
+        indexes = [
+            models.Index(fields=['department', 'week_start', 'status'], name='idx_plan_dept_week_status'),
+            models.Index(fields=['status'], name='idx_plan_status'),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['department', 'week_start'],
+                condition=models.Q(status='APPROVED'),
+                name='uq_approved_plan_per_dept_week',
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.name or "SchedulePlan"} [{self.week_start} to {self.week_end}] - {self.status}'
+
+
+class ScheduleAssignment(models.Model):
+    class Source(models.TextChoices):
+        GA = 'GA', 'GA'
+        MANUAL = 'MANUAL', 'Manual'
+
+    schedule_plan = models.ForeignKey(
+        SchedulePlan,
+        on_delete=models.CASCADE,
+        related_name='assignments',
+    )
+    patient = models.ForeignKey(
+        Patient,
+        on_delete=models.PROTECT,
+        related_name='schedule_assignments',
+    )
+    machine = models.ForeignKey(
+        DialysisMachine,
+        on_delete=models.PROTECT,
+        related_name='schedule_assignments',
+    )
+    scheduled_date = models.DateField()
+    shift = models.CharField(max_length=20, choices=Shift.choices)
+    start_datetime = models.DateTimeField()
+    end_datetime = models.DateTimeField()
+    source = models.CharField(
+        max_length=20,
+        choices=Source.choices,
+        default=Source.GA,
+    )
+    original_machine = models.ForeignKey(
+        DialysisMachine,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='+',
+    )
+    original_shift = models.CharField(
+        max_length=20,
+        choices=Shift.choices,
+        null=True,
+        blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['scheduled_date', 'shift', 'machine']
+        indexes = [
+            models.Index(fields=['schedule_plan', 'scheduled_date'], name='idx_asgn_plan_date'),
+            models.Index(fields=['patient', 'scheduled_date'], name='idx_asgn_patient_date'),
+            models.Index(fields=['machine', 'scheduled_date', 'shift'], name='idx_asgn_machine_date_shift'),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['schedule_plan', 'machine', 'scheduled_date', 'shift'],
+                name='uq_asgn_plan_machine_date_shift',
+            ),
+            models.UniqueConstraint(
+                fields=['schedule_plan', 'patient', 'scheduled_date'],
+                name='uq_asgn_plan_patient_date',
+            ),
+            models.CheckConstraint(
+                check=models.Q(start_datetime__lt=models.F('end_datetime')),
+                name='chk_asgn_start_before_end',
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.patient_id} @ {self.machine_id} [{self.scheduled_date} {self.shift}]'
 
