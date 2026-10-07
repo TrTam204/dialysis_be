@@ -353,7 +353,7 @@ class SchedulePlanViewSet(BaseRoleAwareViewSet):
     ordering = ['-week_start']
 
     def get_permissions(self):
-        if self.action in {'create', 'update', 'partial_update', 'approve', 'reject'}:
+        if self.action in {'create', 'update', 'partial_update', 'approve', 'reject', 'generate'}:
             self.permission_classes = [permissions.IsAuthenticated, IsAdminOrDoctor]
         elif self.action == 'destroy':
             self.permission_classes = [permissions.IsAuthenticated, IsAdmin]
@@ -363,6 +363,32 @@ class SchedulePlanViewSet(BaseRoleAwareViewSet):
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
+
+    @action(detail=False, methods=['post'], url_path='generate')
+    def generate(self, request):
+        department_id = request.data.get('department')
+        week_start_str = request.data.get('week_start')
+
+        if not department_id or not week_start_str:
+            return Response({'detail': 'department and week_start are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            from datetime import datetime
+            week_start = datetime.strptime(week_start_str, '%Y-%m-%d').date()
+            if week_start.weekday() != 0:
+                return Response({'detail': 'Tuần bắt đầu phải là Thứ 2.'}, status=status.HTTP_400_BAD_REQUEST)
+        except ValueError:
+            return Response({'detail': 'week_start must be YYYY-MM-DD format.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check permission (IsAdminOrDoctor) is handled by get_permissions since I need to add 'generate' to it!
+        # Wait, I should add 'generate' to IsAdminOrDoctor in get_permissions.
+        from core.ga_service import GeneticAlgorithmService
+        plan, err = GeneticAlgorithmService.generate_plan(department_id, week_start, request.user)
+        if err:
+            return Response({'detail': err}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = self.get_serializer(plan)
+        return Response({'plan': serializer.data, 'detail': 'Khởi tạo kế hoạch bằng GA thành công.'}, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['post'], url_path='approve')
     def approve(self, request, pk=None):
