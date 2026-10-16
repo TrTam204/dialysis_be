@@ -23,6 +23,7 @@ from .views import (
     report_machine_utilization_view,
     report_operational_summary_view,
 )
+from .views_topsis import TopsisCriteriaView, TopsisRankView
 
 router = DefaultRouter()
 router.register(r'departments', DepartmentViewSet, basename='department')
@@ -47,5 +48,7 @@ urlpatterns = [
     path('reports/machines/', MachineReportView.as_view(), name='reports-machines'),
     path('reports/nurse-workload/', NurseWorkloadReportView.as_view(), name='reports-nurse-workload'),
     path('reports/blood-samples/', BloodSampleReportView.as_view(), name='reports-blood-samples'),
+    path('topsis/criteria/', TopsisCriteriaView.as_view(), name='topsis-criteria'),
+    path('topsis/rank/', TopsisRankView.as_view(), name='topsis-rank'),
     path('', include(router.urls)),
 ]

@@ -84,6 +84,12 @@ class CustomUserSerializer(serializers.ModelSerializer):
 
 
 class PatientSerializer(serializers.ModelSerializer):
+    department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    department_name = serializers.CharField(source='department.name', read_only=True, default=None)
     location = serializers.SerializerMethodField()
 
     class Meta:
@@ -98,6 +104,8 @@ class PatientSerializer(serializers.ModelSerializer):
             'dry_weight',
             'location',
             'status',
+            'department',
+            'department_name',
             'preferred_shift',
             'treatment_pattern',
             'created_at',
@@ -113,6 +121,60 @@ class PatientSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         validate_patient_data(attrs, self.instance)
+
+        request = self.context.get('request')
+        user = getattr(request, 'user', None) if request else None
+        is_admin = bool(user and user.is_authenticated and user.role == CustomUser.Role.ADMIN)
+
+        # 1. CREATE rules (Milestone 1B Part 2)
+        if self.instance is None:
+            if not is_admin:
+                user_dept = getattr(user, 'department', None) if user else None
+                if not user_dept or not getattr(user_dept, 'is_active', False):
+                    raise serializers.ValidationError({
+                        'department': ['Tài khoản người dùng không thuộc khoa nào đang hoạt động.']
+                    })
+
+                req_dept = attrs.get('department')
+                if req_dept is not None and req_dept != user_dept:
+                    raise serializers.ValidationError({
+                        'department': ['Bác sĩ chỉ được tạo bệnh nhân thuộc khoa của mình.']
+                    })
+
+                # Tự động gán khoa của người tạo
+                attrs['department'] = user_dept
+            else:
+                req_dept = attrs.get('department')
+                if req_dept is not None and not req_dept.is_active:
+                    raise serializers.ValidationError({
+                        'department': ['Khoa đã ngừng hoạt động không thể tiếp nhận bệnh nhân mới.']
+                    })
+                # Nếu ADMIN không truyền department, giữ nguyên None cho tương thích chuyển tiếp
+
+        # 2. UPDATE / PATCH rules (Milestone 1B)
+        else:
+            if 'department' in attrs:
+                new_dept = attrs['department']
+                old_dept = self.instance.department
+                if new_dept != old_dept:
+                    if not is_admin:
+                        raise serializers.ValidationError({
+                            'department': ['Chỉ ADMIN mới có quyền gán khoa cho bệnh nhân.']
+                        })
+
+                    if old_dept is not None:
+                        raise serializers.ValidationError({
+                            'department': [
+                                'Không thể thay đổi khoa đã gán qua cập nhật thông thường. '
+                                'Việc chuyển khoa phải được thực hiện qua quy trình chuyển khoa (transfer).'
+                            ]
+                        })
+
+                    if new_dept is not None and not new_dept.is_active:
+                        raise serializers.ValidationError({
+                            'department': ['Khoa đã ngừng hoạt động không thể tiếp nhận bệnh nhân mới.']
+                        })
+
         return attrs
 
 

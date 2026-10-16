@@ -80,6 +80,7 @@ class SchedulingApprovalTests(APITestCase):
             status='ACTIVE',
             preferred_shift='SHIFT_1',
             treatment_pattern='T2_T4_T6',
+            department=cls.dept,
         )
         cls.patient2 = Patient.objects.create(
             patient_id='P-APP-02',
@@ -89,6 +90,7 @@ class SchedulingApprovalTests(APITestCase):
             status='IN_TREATMENT',
             preferred_shift='SHIFT_2',
             treatment_pattern='T2_T4_T6',
+            department=cls.dept,
         )
 
     def _create_valid_plan_with_assignments(self, name='Plan Valid'):

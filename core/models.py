@@ -51,6 +51,13 @@ class Patient(models.Model):
     dry_weight = models.FloatField(blank=True, null=True)
     location = models.PointField(srid=4326, blank=True, null=True)
     status = models.CharField(max_length=20, choices=Status.choices, default='ACTIVE')
+    department = models.ForeignKey(
+        Department,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='patients',
+    )
     preferred_shift = models.CharField(
         max_length=20,
         choices=Shift.choices,

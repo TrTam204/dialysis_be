@@ -106,9 +106,9 @@ class CustomUserViewSet(BaseRoleAwareViewSet):
 
 
 class PatientViewSet(BaseRoleAwareViewSet):
-    queryset = Patient.objects.all().order_by('patient_id')
+    queryset = Patient.objects.select_related('department').all().order_by('patient_id')
     serializer_class = PatientSerializer
-    filterset_fields = ['status', 'gender', 'date_of_birth']
+    filterset_fields = ['status', 'gender', 'date_of_birth', 'department']
     search_fields = ['patient_id', 'full_name', 'phone_number']
     ordering_fields = ['patient_id', 'full_name', 'status', 'date_of_birth', 'created_at']
     ordering = ['patient_id']
@@ -352,6 +352,17 @@ class SchedulePlanViewSet(BaseRoleAwareViewSet):
     ordering_fields = ['id', 'week_start', 'week_end', 'status', 'created_at']
     ordering = ['-week_start']
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if not user or not user.is_authenticated:
+            return qs.none()
+        if user.role == 'ADMIN':
+            return qs
+        if user.department_id:
+            return qs.filter(department_id=user.department_id)
+        return qs.none()
+
     def get_permissions(self):
         if self.action in {'create', 'update', 'partial_update', 'approve', 'reject', 'generate'}:
             self.permission_classes = [permissions.IsAuthenticated, IsAdminOrDoctor]
@@ -372,6 +383,17 @@ class SchedulePlanViewSet(BaseRoleAwareViewSet):
         if not department_id or not week_start_str:
             return Response({'detail': 'department and week_start are required.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        # RBAC: Doctor can only generate for their own department
+        if request.user.role == 'DOCTOR':
+            if not request.user.department_id:
+                return Response({'detail': 'Bác sĩ chưa được phân công khoa phòng.'}, status=status.HTTP_403_FORBIDDEN)
+            try:
+                dept_id_int = int(department_id)
+            except (ValueError, TypeError):
+                return Response({'detail': 'department must be an integer ID.'}, status=status.HTTP_400_BAD_REQUEST)
+            if dept_id_int != request.user.department_id:
+                return Response({'detail': 'Bác sĩ chỉ có quyền tạo lịch cho khoa của mình.'}, status=status.HTTP_403_FORBIDDEN)
+
         try:
             from datetime import datetime
             week_start = datetime.strptime(week_start_str, '%Y-%m-%d').date()
@@ -380,10 +402,17 @@ class SchedulePlanViewSet(BaseRoleAwareViewSet):
         except ValueError:
             return Response({'detail': 'week_start must be YYYY-MM-DD format.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Check permission (IsAdminOrDoctor) is handled by get_permissions since I need to add 'generate' to it!
-        # Wait, I should add 'generate' to IsAdminOrDoctor in get_permissions.
+        seed = request.data.get('seed')
+        if seed is not None and seed != '':
+            try:
+                seed = int(seed)
+            except (ValueError, TypeError):
+                seed = None
+        else:
+            seed = None
+
         from core.ga_service import GeneticAlgorithmService
-        plan, err = GeneticAlgorithmService.generate_plan(department_id, week_start, request.user)
+        plan, err = GeneticAlgorithmService.generate_plan(department_id, week_start, request.user, seed=seed)
         if err:
             return Response({'detail': err}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -393,6 +422,8 @@ class SchedulePlanViewSet(BaseRoleAwareViewSet):
     @action(detail=True, methods=['post'], url_path='approve')
     def approve(self, request, pk=None):
         plan = self.get_object()
+        if request.user.role == 'DOCTOR' and request.user.department_id and plan.department_id != request.user.department_id:
+            return Response({'detail': 'Bác sĩ chỉ có quyền phê duyệt kế hoạch thuộc khoa của mình.'}, status=status.HTTP_403_FORBIDDEN)
         try:
             approved_plan, warnings, sessions = approve_schedule_plan(plan.pk, request.user)
             serializer = self.get_serializer(approved_plan)
@@ -411,6 +442,8 @@ class SchedulePlanViewSet(BaseRoleAwareViewSet):
     @action(detail=True, methods=['post'], url_path='reject')
     def reject(self, request, pk=None):
         plan = self.get_object()
+        if request.user.role == 'DOCTOR' and request.user.department_id and plan.department_id != request.user.department_id:
+            return Response({'detail': 'Bác sĩ chỉ có quyền từ chối kế hoạch thuộc khoa của mình.'}, status=status.HTTP_403_FORBIDDEN)
         reason = request.data.get('reason', '')
         try:
             rejected_plan = reject_schedule_plan(plan.pk, request.user, reason)
@@ -442,6 +475,17 @@ class ScheduleAssignmentViewSet(BaseRoleAwareViewSet):
     search_fields = ['patient__full_name', 'patient__patient_id', 'machine__name']
     ordering_fields = ['id', 'scheduled_date', 'shift', 'created_at']
     ordering = ['scheduled_date', 'shift']
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if not user or not user.is_authenticated:
+            return qs.none()
+        if user.role == 'ADMIN':
+            return qs
+        if user.department_id:
+            return qs.filter(schedule_plan__department_id=user.department_id)
+        return qs.none()
 
     def get_permissions(self):
         if self.action in {'create', 'update', 'partial_update'}:

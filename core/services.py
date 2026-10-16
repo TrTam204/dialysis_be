@@ -1,3 +1,4 @@
+from collections import defaultdict
 from datetime import datetime, timedelta
 
 from django.core.cache import cache
@@ -650,10 +651,37 @@ def validate_schedule_plan_for_approval(plan: SchedulePlan) -> dict:
                 f'Patient {asgn.patient_id} has a conflicting DialysisSession ({conflict_session.session_id}) overlapping [{asgn.start_datetime}, {asgn.end_datetime}].'
             )
 
+        # 11. Cross-department checks: machine and patient must match plan department
+        plan_dept_id = getattr(plan, 'department_id', None)
+        if plan_dept_id:
+            dept = getattr(plan, 'department', None)
+            dept_name = getattr(dept, 'name', f'ID {plan_dept_id}')
+            dept_code = getattr(dept, 'code', str(plan_dept_id))
+            mach_dept_id = getattr(asgn.machine, 'department_id', None)
+            pat_dept_id = getattr(asgn.patient, 'department_id', None)
+            if mach_dept_id != plan_dept_id:
+                errors.append(
+                    f'Machine {asgn.machine_id} does not belong to plan department {dept_name} ({dept_code}).'
+                )
+            if pat_dept_id != plan_dept_id:
+                errors.append(
+                    f'Patient {asgn.patient_id} does not belong to plan department {dept_name} ({dept_code}).'
+                )
+
         # Soft constraint: preferred_shift mismatch
         if asgn.patient.preferred_shift and asgn.shift != asgn.patient.preferred_shift:
             warnings.append(
                 f'Patient {asgn.patient_id} preferred shift is {asgn.patient.preferred_shift}, but scheduled for {asgn.shift} on {asgn.scheduled_date}.'
+            )
+
+    # 12. Check max 1 session per patient per day in assignments
+    patient_daily_map = defaultdict(list)
+    for asgn in assignments:
+        patient_daily_map[(asgn.patient_id, asgn.scheduled_date)].append(asgn)
+    for (pid, s_date), asgns in patient_daily_map.items():
+        if len(asgns) > 1:
+            errors.append(
+                f'Patient {pid} has {len(asgns)} assignments on {s_date}. Maximum 1 session per patient per day is allowed.'
             )
 
     return {
