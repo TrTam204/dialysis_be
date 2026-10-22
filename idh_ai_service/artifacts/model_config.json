@@ -1,0 +1,15 @@
+{
+  "input_dim": 7,
+  "hidden_dim": 64,
+  "num_layers": 2,
+  "sequence_length": 5,
+  "feature_names": [
+    "systolic_bp",
+    "diastolic_bp",
+    "map",
+    "heart_rate",
+    "uf_rate",
+    "cumulative_uf",
+    "time_elapsed_min"
+  ]
+}
