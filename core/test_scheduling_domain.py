@@ -336,3 +336,195 @@ class SchedulingDomainTests(APITestCase):
                     start_datetime=start_dt,
                     end_datetime=end_dt,
                 )
+
+    def test_11_session_validation_broken_or_maintenance_machine_rejected(self):
+        self.client.force_authenticate(user=self.doctor_user)
+        patient = Patient.objects.create(
+            patient_id='PT-M9-MSTAT',
+            full_name='Patient Machine Status',
+            date_of_birth=date(1990, 1, 1),
+            status=Patient.Status.ACTIVE,
+        )
+        broken_mach = DialysisMachine.objects.create(
+            machine_id='M-M9-BRK',
+            name='Machine Broken',
+            status=DialysisMachine.Status.BROKEN,
+            department=self.dept,
+        )
+        maint_mach = DialysisMachine.objects.create(
+            machine_id='M-M9-MNT',
+            name='Machine Maintenance',
+            status=DialysisMachine.Status.MAINTENANCE,
+            department=self.dept,
+        )
+        now = timezone.now() + timedelta(days=20)
+        data_broken = {
+            'session_id': 'SS-M9-BRK-01',
+            'patient': patient.patient_id,
+            'machine': broken_mach.machine_id,
+            'scheduled_start': now.isoformat(),
+            'scheduled_end': (now + timedelta(hours=4)).isoformat(),
+            'status': DialysisSession.Status.SCHEDULED,
+        }
+        res_brk = self.client.post('/api/sessions/', data_broken, format='json')
+        self.assertEqual(res_brk.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Cannot schedule session on a machine that is broken or under maintenance.', str(res_brk.data['machine']))
+
+        data_maint = {
+            'session_id': 'SS-M9-MNT-01',
+            'patient': patient.patient_id,
+            'machine': maint_mach.machine_id,
+            'scheduled_start': now.isoformat(),
+            'scheduled_end': (now + timedelta(hours=4)).isoformat(),
+            'status': DialysisSession.Status.SCHEDULED,
+        }
+        res_mnt = self.client.post('/api/sessions/', data_maint, format='json')
+        self.assertEqual(res_mnt.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Cannot schedule session on a machine that is broken or under maintenance.', str(res_mnt.data['machine']))
+
+    def test_12_session_validation_discharged_patient_rejected(self):
+        self.client.force_authenticate(user=self.doctor_user)
+        patient_disc = Patient.objects.create(
+            patient_id='PT-M9-DISC',
+            full_name='Patient Discharged',
+            date_of_birth=date(1985, 5, 5),
+            status=Patient.Status.DISCHARGED,
+        )
+        now = timezone.now() + timedelta(days=21)
+        data = {
+            'session_id': 'SS-M9-DISC-01',
+            'patient': patient_disc.patient_id,
+            'machine': self.machine1.machine_id,
+            'scheduled_start': now.isoformat(),
+            'scheduled_end': (now + timedelta(hours=4)).isoformat(),
+            'status': DialysisSession.Status.SCHEDULED,
+        }
+        res = self.client.post('/api/sessions/', data, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Cannot schedule session for a discharged patient.', str(res.data['patient']))
+
+    def test_13_session_validation_patient_overlap_rejected(self):
+        self.client.force_authenticate(user=self.doctor_user)
+        patient = Patient.objects.create(
+            patient_id='PT-M9-POVLP',
+            full_name='Patient Overlap Test',
+            date_of_birth=date(1988, 8, 8),
+            status=Patient.Status.ACTIVE,
+        )
+        now = timezone.now() + timedelta(days=22)
+        start1 = now
+        end1 = now + timedelta(hours=4)
+
+        # First session on machine 1
+        s1 = DialysisSession.objects.create(
+            session_id='SS-M9-POVLP-1',
+            patient=patient,
+            machine=self.machine1,
+            scheduled_start=start1,
+            scheduled_end=end1,
+            status=DialysisSession.Status.SCHEDULED,
+        )
+
+        # Overlapping session on machine 2 for the same patient
+        data_overlap = {
+            'session_id': 'SS-M9-POVLP-2',
+            'patient': patient.patient_id,
+            'machine': self.machine2.machine_id,
+            'scheduled_start': (start1 + timedelta(hours=1)).isoformat(),
+            'scheduled_end': (end1 + timedelta(hours=1)).isoformat(),
+            'status': DialysisSession.Status.SCHEDULED,
+        }
+        res = self.client.post('/api/sessions/', data_overlap, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Patient already has an overlapping dialysis session in this time window.', str(res.data['patient']))
+
+    def test_14_session_validation_nurse_concurrency_limit(self):
+        self.client.force_authenticate(user=self.doctor_user)
+        now = timezone.now() + timedelta(days=23)
+        start_t = now
+        end_t = now + timedelta(hours=4)
+
+        # Create 4 patients and 4 machines
+        machines = []
+        for i in range(1, 6):
+            m = DialysisMachine.objects.create(
+                machine_id=f'M-M9-NC-{i}',
+                name=f'Machine Nurse Concurrency {i}',
+                status=DialysisMachine.Status.AVAILABLE,
+                department=self.dept,
+            )
+            machines.append(m)
+
+        for i in range(1, 5):
+            p = Patient.objects.create(
+                patient_id=f'PT-M9-NC-{i}',
+                full_name=f'Patient Nurse Concurrency {i}',
+                date_of_birth=date(1990, 1, 1),
+                status=Patient.Status.ACTIVE,
+            )
+            DialysisSession.objects.create(
+                session_id=f'SS-M9-NC-{i}',
+                patient=p,
+                machine=machines[i-1],
+                assigned_nurse=self.nurse_user,
+                scheduled_start=start_t,
+                scheduled_end=end_t,
+                status=DialysisSession.Status.SCHEDULED,
+            )
+
+        # 5th session with the same nurse in the same time window should be rejected
+        p5 = Patient.objects.create(
+            patient_id='PT-M9-NC-5',
+            full_name='Patient Nurse Concurrency 5',
+            date_of_birth=date(1990, 1, 1),
+            status=Patient.Status.ACTIVE,
+        )
+        data_5th = {
+            'session_id': 'SS-M9-NC-5',
+            'patient': p5.patient_id,
+            'machine': machines[4].machine_id,
+            'assigned_nurse': self.nurse_user.id,
+            'scheduled_start': (start_t + timedelta(minutes=30)).isoformat(),
+            'scheduled_end': (end_t - timedelta(minutes=30)).isoformat(),
+            'status': DialysisSession.Status.SCHEDULED,
+        }
+        res = self.client.post('/api/sessions/', data_5th, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Nurse cannot be assigned to more than 4 overlapping sessions at the same time.', str(res.data['assigned_nurse']))
+
+    def test_15_session_validation_cancelled_sessions_excluded_from_overlap_and_concurrency(self):
+        self.client.force_authenticate(user=self.doctor_user)
+        now = timezone.now() + timedelta(days=24)
+        start_t = now
+        end_t = now + timedelta(hours=4)
+
+        patient = Patient.objects.create(
+            patient_id='PT-M9-CANC',
+            full_name='Patient Cancelled Exclude',
+            date_of_birth=date(1990, 1, 1),
+            status=Patient.Status.ACTIVE,
+        )
+
+        # Create a CANCELLED session on machine1 for this patient with nurse
+        DialysisSession.objects.create(
+            session_id='SS-M9-CANC-01',
+            patient=patient,
+            machine=self.machine1,
+            assigned_nurse=self.nurse_user,
+            scheduled_start=start_t,
+            scheduled_end=end_t,
+            status=DialysisSession.Status.CANCELLED,
+        )
+
+        # A new session in the exact same time window for same machine, patient, and nurse should SUCCEED
+        data = {
+            'session_id': 'SS-M9-CANC-02',
+            'patient': patient.patient_id,
+            'machine': self.machine1.machine_id,
+            'assigned_nurse': self.nurse_user.id,
+            'scheduled_start': start_t.isoformat(),
+            'scheduled_end': end_t.isoformat(),
+            'status': DialysisSession.Status.SCHEDULED,
+        }
+        res = self.client.post('/api/sessions/', data, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)

@@ -183,6 +183,9 @@ def validate_blood_sample_data(attrs, instance=None):
         raise ValidationError(errors)
 
 
+MAX_CONCURRENT_SESSIONS_PER_NURSE = 4
+
+
 def validate_session_data(attrs, instance=None):
     errors = {}
 
@@ -195,17 +198,8 @@ def validate_session_data(attrs, instance=None):
     if assigned_nurse is not None and assigned_nurse.role != CustomUser.Role.NURSE:
         errors['assigned_nurse'] = ['assigned_nurse must be a user with role NURSE.']
 
+    patient = _merged(attrs, instance, 'patient')
     machine = _merged(attrs, instance, 'machine')
-    if machine and scheduled_start and scheduled_end and scheduled_end > scheduled_start:
-        overlapping = DialysisSession.objects.filter(
-            machine=machine,
-            scheduled_start__lt=scheduled_end,
-            scheduled_end__gt=scheduled_start,
-        )
-        if instance and instance.pk:
-            overlapping = overlapping.exclude(pk=instance.pk)
-        if overlapping.exists():
-            errors['machine'] = ['This machine already has a session overlapping the selected time window.']
 
     # State machine transition protection
     if instance and 'status' in attrs:
@@ -221,6 +215,59 @@ def validate_session_data(attrs, instance=None):
             allowed = ALLOWED_TRANSITIONS.get(old_status, set())
             if new_status not in allowed:
                 errors['status'] = [f'Invalid status transition from {old_status} to {new_status}.']
+
+    target_status = attrs.get('status', instance.status if instance else DialysisSession.Status.SCHEDULED)
+
+    # Overlap and availability checks apply only when target status is not CANCELLED
+    if target_status != DialysisSession.Status.CANCELLED:
+        # Machine status check: broken or maintenance machine cannot be scheduled
+        if machine and machine.status in (DialysisMachine.Status.BROKEN, DialysisMachine.Status.MAINTENANCE):
+            if instance is None or machine != instance.machine or target_status in (DialysisSession.Status.SCHEDULED, DialysisSession.Status.IN_PROGRESS):
+                errors['machine'] = ['Cannot schedule session on a machine that is broken or under maintenance.']
+
+        # Patient status check: discharged patient cannot be scheduled
+        if patient and patient.status == Patient.Status.DISCHARGED:
+            if instance is None or patient != instance.patient or target_status in (DialysisSession.Status.SCHEDULED, DialysisSession.Status.IN_PROGRESS):
+                errors['patient'] = ['Cannot schedule session for a discharged patient.']
+
+        if scheduled_start and scheduled_end and scheduled_end > scheduled_start:
+            # Machine overlap check
+            if machine:
+                overlapping = DialysisSession.objects.filter(
+                    machine=machine,
+                    scheduled_start__lt=scheduled_end,
+                    scheduled_end__gt=scheduled_start,
+                ).exclude(status=DialysisSession.Status.CANCELLED)
+                if instance and instance.pk:
+                    overlapping = overlapping.exclude(pk=instance.pk)
+                if overlapping.exists():
+                    errors['machine'] = ['This machine already has a session overlapping the selected time window.']
+
+            # Patient overlap check
+            if patient:
+                pat_overlapping = DialysisSession.objects.filter(
+                    patient=patient,
+                    scheduled_start__lt=scheduled_end,
+                    scheduled_end__gt=scheduled_start,
+                ).exclude(status=DialysisSession.Status.CANCELLED)
+                if instance and instance.pk:
+                    pat_overlapping = pat_overlapping.exclude(pk=instance.pk)
+                if pat_overlapping.exists():
+                    errors['patient'] = ['Patient already has an overlapping dialysis session in this time window.']
+
+            # Nurse concurrency limit (MAX_CONCURRENT_SESSIONS_PER_NURSE = 4)
+            if assigned_nurse and assigned_nurse.role == CustomUser.Role.NURSE:
+                nurse_overlapping = DialysisSession.objects.filter(
+                    assigned_nurse=assigned_nurse,
+                    scheduled_start__lt=scheduled_end,
+                    scheduled_end__gt=scheduled_start,
+                ).exclude(status=DialysisSession.Status.CANCELLED)
+                if instance and instance.pk:
+                    nurse_overlapping = nurse_overlapping.exclude(pk=instance.pk)
+                if nurse_overlapping.count() >= MAX_CONCURRENT_SESSIONS_PER_NURSE:
+                    errors['assigned_nurse'] = [
+                        f'Nurse cannot be assigned to more than {MAX_CONCURRENT_SESSIONS_PER_NURSE} overlapping sessions at the same time.'
+                    ]
 
     # Auto-stamp actual start/end on state transition if not provided
     if attrs.get('status') == DialysisSession.Status.IN_PROGRESS:
