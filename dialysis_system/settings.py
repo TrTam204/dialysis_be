@@ -191,3 +191,6 @@ if pg_bin_path:
         GDAL_LIBRARY_PATH = gdal_files[0]
 
     GEOS_LIBRARY_PATH = os.path.join(pg_bin_path, 'libgeos_c.dll')
+
+# AI Microservice URL (FastAPI LSTM IDH prediction service)
+FASTAPI_IDH_SERVICE_URL = os.getenv('FASTAPI_IDH_SERVICE_URL', 'http://127.0.0.1:8001')

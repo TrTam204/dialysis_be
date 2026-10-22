@@ -42,6 +42,7 @@ from .serializers import (
     VitalSignSerializer,
 )
 from .kmeans_service import KMeansClusteringService
+from .ai_bridge import predict_idh_for_session, get_lstm_model_info
 from .services import (
     approve_schedule_plan,
     dashboard_dialysis_stats,
@@ -203,6 +204,12 @@ class DialysisSessionViewSet(BaseRoleAwareViewSet):
             vital = serializer.save(session=session, recorded_by=request.user)
             record_audit_log(actor=request.user, action=AuditLog.Action.CREATE, instance=vital)
         return Response(serializer.data, status=201)
+
+    @action(detail=True, methods=['get'], url_path='idh-prediction')
+    def idh_prediction(self, request, pk=None):
+        session = self.get_object()
+        result = predict_idh_for_session(session)
+        return Response(result, status=status.HTTP_200_OK)
 
 
 class BloodSampleViewSet(BaseRoleAwareViewSet):
@@ -567,3 +574,15 @@ class KMeansReportView(APIView):
             'iterations': result.get('iterations', 0),
             'converged': result.get('converged', True),
         }, status=status.HTTP_200_OK)
+
+
+class LSTMModelInfoView(APIView):
+    """
+    Exposes LSTM IDH prediction model architecture, evaluation metrics
+    (Accuracy, Precision, Recall, F1, Loss, Confusion Matrix), and training curves.
+    """
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember]
+
+    def get(self, request):
+        info = get_lstm_model_info()
+        return Response(info, status=status.HTTP_200_OK)
