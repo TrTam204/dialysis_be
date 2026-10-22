@@ -3,6 +3,7 @@ from django.db.models import ProtectedError
 from django.shortcuts import get_object_or_404
 from django_filters import rest_framework as django_filters
 from rest_framework import filters, permissions, status, viewsets
+from rest_framework.views import APIView
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
@@ -40,6 +41,7 @@ from .serializers import (
     SchedulePlanSerializer,
     VitalSignSerializer,
 )
+from .kmeans_service import KMeansClusteringService
 from .services import (
     approve_schedule_plan,
     dashboard_dialysis_stats,
@@ -495,3 +497,73 @@ class ScheduleAssignmentViewSet(BaseRoleAwareViewSet):
         else:
             self.permission_classes = [permissions.IsAuthenticated, IsStaffMember]
         return super().get_permissions()
+
+
+class KMeansReportView(APIView):
+    """
+    Unsupervised Machine Learning: Pure Python K-Means patient clustering report.
+    Clusters hemodialysis patients based on 4 clinical/biochemical features:
+    age, avg_hemoglobin, avg_potassium, and avg_uf.
+    """
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember]
+
+    def get(self, request):
+        k_param = request.query_params.get('k', 3)
+        try:
+            k = int(k_param)
+            if k <= 0:
+                return Response(
+                    {'detail': 'k must be a positive integer.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        except (ValueError, TypeError):
+            return Response(
+                {'detail': 'Invalid k parameter. Must be an integer.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        seed_param = request.query_params.get('seed', 42)
+        try:
+            seed = int(seed_param)
+        except (ValueError, TypeError):
+            seed = 42
+
+        inc_disc_param = request.query_params.get('include_discharged', 'false').lower()
+        include_discharged = inc_disc_param in {'true', '1', 'yes'}
+
+        department_id = request.query_params.get('department')
+        if department_id:
+            try:
+                department_id = int(department_id)
+            except (ValueError, TypeError):
+                return Response(
+                    {'detail': 'Invalid department ID.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            # If user is DOCTOR and department is not specified, scope to their department if it has patients
+            if getattr(request.user, 'role', None) == CustomUser.Role.DOCTOR:
+                doctor_dept_id = getattr(request.user, 'department_id', None)
+                if doctor_dept_id and Patient.objects.filter(department_id=doctor_dept_id).exists():
+                    department_id = doctor_dept_id
+
+        service = KMeansClusteringService(
+            department_id=department_id,
+            include_discharged=include_discharged,
+        )
+        result = service.run_kmeans(k=k, seed=seed)
+
+        return Response({
+            'success': True,
+            'k_value': result['k_value'],
+            'wcss': result['wcss'],
+            'silhouette_score': result['silhouette_score'],
+            'centroids': result['centroids'],
+            'denormalized_centroids': result.get('denormalized_centroids', []),
+            'cluster_summaries': result.get('cluster_summaries', []),
+            'min_max': result.get('min_max', {}),
+            'clusters': result['clusters'],
+            'patients': result.get('patients', []),
+            'iterations': result.get('iterations', 0),
+            'converged': result.get('converged', True),
+        }, status=status.HTTP_200_OK)
