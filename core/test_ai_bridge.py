@@ -185,6 +185,9 @@ class AIBridgeTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(response.data['has_prediction'])
         self.assertEqual(response.data['risk_level'], 'HIGH')
+        self.assertEqual(response.data.get('model_version'), '1.0.0')
+        self.assertIn('predicted_at', response.data)
+        self.assertIn('disclaimer', response.data)
         self.assertTrue(response.data['is_idh_predicted'])
         self.assertGreaterEqual(response.data['risk_probability'], 0.65)
         self.assertTrue(any('CẢNH BÁO CAO' in rec for rec in response.data['clinical_recommendations']))
@@ -218,3 +221,45 @@ class AIBridgeTests(APITestCase):
         first_ep = data['training_history'][0]
         self.assertIn('train_loss', first_ep)
         self.assertIn('train_accuracy', first_ep)
+
+    def test_06_idh_prediction_doctor_cross_department_forbidden(self):
+        other_dept = Department.objects.create(name='Khoa Ngoai B', code='K-NG-B')
+        doctor_other = CustomUser.objects.create_user(
+            username='doctor_other_dept',
+            email='doc_other@example.com',
+            password='Password123!',
+            role=CustomUser.Role.DOCTOR,
+            department=other_dept,
+        )
+        session = DialysisSession.objects.create(
+            session_id='SS-AIB-RBAC-01',
+            patient=self.patient,
+            machine=self.machine,
+            scheduled_start=self.now,
+            scheduled_end=self.now + timedelta(hours=4),
+            status=DialysisSession.Status.IN_PROGRESS,
+        )
+        self.client.force_authenticate(user=doctor_other)
+        response = self.client.get(f'/api/sessions/{session.session_id}/idh-prediction/')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_07_idh_prediction_nurse_cross_department_forbidden(self):
+        other_dept = Department.objects.create(name='Khoa Ngoai C', code='K-NG-C')
+        nurse_other = CustomUser.objects.create_user(
+            username='nurse_other_dept',
+            email='nurse_other@example.com',
+            password='Password123!',
+            role=CustomUser.Role.NURSE,
+            department=other_dept,
+        )
+        session = DialysisSession.objects.create(
+            session_id='SS-AIB-RBAC-02',
+            patient=self.patient,
+            machine=self.machine,
+            scheduled_start=self.now,
+            scheduled_end=self.now + timedelta(hours=4),
+            status=DialysisSession.Status.IN_PROGRESS,
+        )
+        self.client.force_authenticate(user=nurse_other)
+        response = self.client.get(f'/api/sessions/{session.session_id}/idh-prediction/')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)

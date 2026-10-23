@@ -230,6 +230,11 @@ class KMeansClusteringTests(APITestCase):
         # Total patients grouped across clusters must equal cohort size (3 active patients)
         total_clustered = sum(len(members) for members in response.data['clusters'].values())
         self.assertEqual(total_clustered, 3)
+        self.assertIn('seed', response.data)
+        self.assertIn('disclaimer', response.data)
+        for p in response.data['patients']:
+            self.assertIn('is_imputed', p)
+            self.assertIn('imputed_fields', p)
 
     def test_kmeans_api_doctor_auto_department_scope(self):
         """
@@ -281,3 +286,12 @@ class KMeansClusteringTests(APITestCase):
         self.assertTrue(result['success'])
         self.assertEqual(result['k_value'], 3)
         self.assertEqual(len(result['patients']), 3)
+
+    def test_kmeans_api_doctor_cross_department_forbidden(self):
+        other_dept = Department.objects.create(
+            name='Khoa Khac Test',
+            code='K-OTHER-KM',
+        )
+        self.client.force_authenticate(user=self.doctor)
+        response = self.client.get(f'/api/reports/kmeans-clusters/?department={other_dept.id}')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)

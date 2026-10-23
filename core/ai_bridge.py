@@ -10,6 +10,7 @@ import os
 import uuid
 import httpx
 from django.conf import settings
+from django.utils import timezone
 
 from idh_ai_service.lstm_model import IDHInferencePipeline
 from core.models import DialysisSession, VitalSign
@@ -125,6 +126,12 @@ def predict_idh_for_session(session: DialysisSession) -> Dict[str, Any]:
     seq_data = build_vitals_sequence(session)
 
     if not seq_data['has_prediction']:
+        seq_data['model_version'] = '1.0.0'
+        seq_data['predicted_at'] = timezone.now().isoformat()
+        seq_data['disclaimer'] = (
+            'Cảnh báo từ mô hình AI chỉ mang tính chất hỗ trợ theo dõi sớm, '
+            'không thay thế quyết định chuyên môn của bác sĩ.'
+        )
         return seq_data
 
     payload = {
@@ -148,6 +155,12 @@ def predict_idh_for_session(session: DialysisSession) -> Dict[str, Any]:
                 result['inference_source'] = 'FASTAPI_MICROSERVICE'
                 result['is_padded'] = seq_data['is_padded']
                 result['recorded_vitals_count'] = seq_data['recorded_count']
+                result['model_version'] = '1.0.0'
+                result['predicted_at'] = timezone.now().isoformat()
+                result['disclaimer'] = (
+                    'Cảnh báo từ mô hình AI chỉ mang tính chất hỗ trợ theo dõi sớm, '
+                    'không thay thế quyết định chuyên môn của bác sĩ.'
+                )
                 return result
     except Exception as exc:
         logger.warning(f"FastAPI IDH service unavailable ({str(exc)}), falling back to local LSTM engine.")
@@ -172,6 +185,12 @@ def predict_idh_for_session(session: DialysisSession) -> Dict[str, Any]:
         'inference_source': 'LOCAL_LSTM_ENGINE',
         'is_padded': seq_data['is_padded'],
         'recorded_vitals_count': seq_data['recorded_count'],
+        'model_version': '1.0.0',
+        'predicted_at': timezone.now().isoformat(),
+        'disclaimer': (
+            'Cảnh báo từ mô hình AI chỉ mang tính chất hỗ trợ theo dõi sớm, '
+            'không thay thế quyết định chuyên môn của bác sĩ.'
+        ),
     }
 
 

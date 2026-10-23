@@ -208,6 +208,26 @@ class DialysisSessionViewSet(BaseRoleAwareViewSet):
     @action(detail=True, methods=['get'], url_path='idh-prediction')
     def idh_prediction(self, request, pk=None):
         session = self.get_object()
+        # RBAC Cross-Department check (Mục V & X Master Plan)
+        user = request.user
+        sess_dept_id = session.machine.department_id if session.machine else (
+            session.patient.department_id if session.patient else None
+        )
+        if user.role == CustomUser.Role.DOCTOR:
+            if not user.department_id or (sess_dept_id and sess_dept_id != user.department_id):
+                return Response(
+                    {'detail': 'Bác sĩ không có quyền truy cập dự báo ca lọc của khoa khác.'},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+        elif user.role == CustomUser.Role.NURSE:
+            is_assigned = (session.assigned_nurse_id == user.id)
+            is_same_dept = bool(user.department_id and sess_dept_id == user.department_id)
+            if not (is_assigned or is_same_dept):
+                return Response(
+                    {'detail': 'Điều dưỡng không có quyền truy cập dự báo ca lọc ngoài khoa hoặc không được phân công.'},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
         result = predict_idh_for_session(session)
         return Response(result, status=status.HTTP_200_OK)
 
@@ -554,6 +574,23 @@ class KMeansReportView(APIView):
                 if doctor_dept_id and Patient.objects.filter(department_id=doctor_dept_id).exists():
                     department_id = doctor_dept_id
 
+        # RBAC Cross-Department check (Mục V & IX Master Plan)
+        user_role = getattr(request.user, 'role', None)
+        user_dept_id = getattr(request.user, 'department_id', None)
+
+        if user_role in (CustomUser.Role.DOCTOR, CustomUser.Role.NURSE):
+            if not user_dept_id:
+                return Response(
+                    {'detail': 'Nhân viên y tế chưa được phân bổ khoa quản lý.'},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            if department_id is not None and int(department_id) != user_dept_id:
+                return Response(
+                    {'detail': 'Bạn không có quyền xem phân cụm bệnh nhân của khoa khác.'},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            department_id = user_dept_id
+
         service = KMeansClusteringService(
             department_id=department_id,
             include_discharged=include_discharged,
@@ -563,6 +600,11 @@ class KMeansReportView(APIView):
         return Response({
             'success': True,
             'k_value': result['k_value'],
+            'seed': seed,
+            'disclaimer': result.get(
+                'disclaimer',
+                'Kết quả phân cụm K-Means chỉ phản ánh độ tương đồng dữ liệu thống kê, dùng để tham khảo phân nhóm quản lý, không thay thế chẩn đoán lâm sàng của bác sĩ.'
+            ),
             'wcss': result['wcss'],
             'silhouette_score': result['silhouette_score'],
             'centroids': result['centroids'],

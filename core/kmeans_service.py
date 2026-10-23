@@ -61,6 +61,7 @@ class KMeansClusteringService:
         features_list = []
 
         for patient in qs:
+            imputed_fields = []
             # 1. Age
             if patient.date_of_birth:
                 dob = patient.date_of_birth
@@ -70,6 +71,7 @@ class KMeansClusteringService:
                 age = max(0.0, age)
             else:
                 age = self.DEFAULT_AGE
+                imputed_fields.append('age')
 
             # 2 & 3. Lab indicators: Hemoglobin and Potassium
             samples = list(patient.blood_samples.all())
@@ -79,6 +81,7 @@ class KMeansClusteringService:
             else:
                 avg_hb = self.DEFAULT_HEMOGLOBIN
                 avg_k = self.DEFAULT_POTASSIUM
+                imputed_fields.extend(['avg_hemoglobin', 'avg_potassium'])
 
             # 4. Ultrafiltration (UF actual) from completed sessions
             sessions = [
@@ -89,12 +92,15 @@ class KMeansClusteringService:
                 avg_uf = sum(s.uf_actual for s in sessions) / len(sessions)
             else:
                 avg_uf = self.DEFAULT_UF
+                imputed_fields.append('avg_uf')
 
             raw_dict = {
                 'age': round(age, 2),
                 'avg_hemoglobin': round(avg_hb, 2),
                 'avg_potassium': round(avg_k, 2),
                 'avg_uf': round(avg_uf, 2),
+                'is_imputed': len(imputed_fields) > 0,
+                'imputed_fields': imputed_fields,
             }
             raw_vector = [age, avg_hb, avg_k, avg_uf]
 
@@ -102,6 +108,8 @@ class KMeansClusteringService:
                 'patient_id': patient.patient_id,
                 'full_name': patient.full_name,
                 'status': patient.status,
+                'is_imputed': len(imputed_fields) > 0,
+                'imputed_fields': imputed_fields,
                 'raw_features': raw_dict,
                 'raw_vector': raw_vector,
             })
@@ -295,26 +303,22 @@ class KMeansClusteringService:
 
             if risk_points >= 4:
                 risk_level = 'HIGH'
-                clinical_recommendation = (
-                    'Nguy cơ biến cố tim mạch và quá tải tuần hoàn cao. '
-                    'Cần theo dõi sát điện giải đồ, điều chỉnh chế độ ăn giảm kali và điều chỉnh dịch lọc.'
-                )
             elif risk_points >= 2:
                 risk_level = 'MEDIUM'
-                clinical_recommendation = (
-                    'Nguy cơ trung bình. Cần duy trì phác đồ hiện tại, '
-                    'kiểm tra định kỳ hemoglobin và nhắc nhở hạn chế muối nước gian lọc.'
-                )
             else:
                 risk_level = 'LOW'
-                clinical_recommendation = (
-                    'Chỉ số sinh hóa và dịch lọc tương đối ổn định. '
-                    'Tiếp tục theo dõi định kỳ theo lịch thường quy.'
-                )
+
+            summary_tag_str = ', '.join(tags[:2]) if tags else 'Chung'
+            cluster_label = f'Cụm {c_idx + 1} — Phân nhóm đặc trưng {summary_tag_str}'
+            clinical_recommendation = (
+                f'Đặc trưng thống kê trung tâm cụm: Tuổi TB {age:.1f}, Hb TB {hb:.1f} g/dL, '
+                f'Kali TB {k_val:.2f} mEq/L, UF TB {uf:.2f} L. Kết quả phân nhóm nhằm mục đích '
+                f'tham khảo quản lý và theo dõi xu hướng thuần túy thống kê.'
+            )
 
             summaries.append({
                 'cluster_id': c_idx,
-                'cluster_label': f'Cụm {c_idx + 1}',
+                'cluster_label': cluster_label,
                 'patient_count': len(clusters.get(c_idx, [])),
                 'risk_level': risk_level,
                 'tags': tags,
@@ -343,6 +347,7 @@ class KMeansClusteringService:
             return {
                 'success': True,
                 'k_value': 0,
+                'seed': seed,
                 'wcss': 0.0,
                 'silhouette_score': 0.0,
                 'centroids': [],
@@ -353,6 +358,10 @@ class KMeansClusteringService:
                 'patients': [],
                 'iterations': 0,
                 'converged': True,
+                'disclaimer': (
+                    'Kết quả phân cụm K-Means chỉ phản ánh độ tương đồng dữ liệu thống kê, '
+                    'dùng để tham khảo phân nhóm quản lý, không thay thế chẩn đoán lâm sàng của bác sĩ.'
+                ),
             }
 
         # Constrain K to number of available data points
@@ -398,7 +407,21 @@ class KMeansClusteringService:
                     ]
                 else:
                     # Empty cluster safeguard: retain previous centroid
-                    new_c = list(centroids[c_idx])
+                    # Empty cluster safeguard: reassign centroid to the point furthest from populated centroids
+                    furthest_point = None
+                    max_min_dist = -1.0
+                    populated = [
+                        [sum(m['normalized_vector'][d] for m in clusters[ci]) / len(clusters[ci]) for d in range(dim)]
+                        for ci in range(actual_k) if clusters[ci]
+                    ]
+                    if populated:
+                        for p in features_list:
+                            p_vec = p['normalized_vector']
+                            min_d = min(self._euclidean_distance(p_vec, pc) for pc in populated)
+                            if min_d > max_min_dist:
+                                max_min_dist = min_d
+                                furthest_point = p_vec
+                    new_c = list(furthest_point) if furthest_point is not None else list(centroids[c_idx])
                 new_centroids.append(new_c)
 
             # 3. Convergence check: Centroids movement < threshold
@@ -442,6 +465,8 @@ class KMeansClusteringService:
                     'full_name': p['full_name'],
                     'cluster_id': c_idx,
                     'status': p['status'],
+                    'is_imputed': p.get('is_imputed', False),
+                    'imputed_fields': p.get('imputed_fields', []),
                     'features': p['raw_features'],
                     'normalized_features': p['normalized_features'],
                 }
@@ -451,6 +476,7 @@ class KMeansClusteringService:
         return {
             'success': True,
             'k_value': actual_k,
+            'seed': seed,
             'wcss': wcss,
             'silhouette_score': silhouette,
             'centroids': centroids_rounded,
@@ -464,6 +490,8 @@ class KMeansClusteringService:
                     'full_name': p['full_name'],
                     'cluster_id': p['cluster_id'],
                     'status': p['status'],
+                    'is_imputed': p.get('is_imputed', False),
+                    'imputed_fields': p.get('imputed_fields', []),
                     'features': p['raw_features'],
                     'normalized_features': p['normalized_features'],
                 }
@@ -471,4 +499,8 @@ class KMeansClusteringService:
             ],
             'iterations': iteration,
             'converged': converged,
+            'disclaimer': (
+                'Kết quả phân cụm K-Means chỉ phản ánh độ tương đồng dữ liệu thống kê, '
+                'dùng để tham khảo phân nhóm quản lý, không thay thế chẩn đoán lâm sàng của bác sĩ.'
+            ),
         }
