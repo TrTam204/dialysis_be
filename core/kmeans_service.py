@@ -3,16 +3,18 @@ Pure Python implementation of K-Means Clustering for Hemodialysis Patients.
 Course milestone: Week 9 unsupervised learning objective (Chapter 2.6 & 3.4).
 
 Constraints:
-- Strictly pure Python standard library (math, random).
+- Strictly pure Python standard library (math, random, typing).
 - Absolutely NO sklearn, numpy, or pandas.
-- Clusters patients based on 4 clinical features:
+- Clusters patients based on 4 clinical/biochemical features:
     1. age (from date_of_birth)
-    2. avg_hemoglobin (from BloodSample)
-    3. avg_potassium (from BloodSample)
-    4. avg_uf (from COMPLETED DialysisSession)
+    2. avg_hemoglobin (from BloodSample, g/dL)
+    3. avg_potassium (from BloodSample, mmol/L)
+    4. avg_idwg_pct (percentage of interdialytic weight gain / UF relative to dry weight, %)
+       (aliased as avg_uf for backward compatibility with existing tests and UI)
 """
 import math
 import random
+from typing import Any, Dict, List, Optional, Tuple
 from django.utils import timezone
 
 from .models import DialysisSession, Patient
@@ -22,148 +24,315 @@ class KMeansClusteringService:
     """
     Self-contained pure-Python K-Means clustering service.
     Includes data extraction, Min-Max normalization, Euclidean distance,
-    iterative Lloyd's clustering algorithm, evaluation metrics (WCSS, Silhouette Score),
-    and clinical cluster profiling.
+    K-Means++ centroid initialization (D^2 weighting), iterative Lloyd's clustering,
+    empty cluster safeguards, multi-K evaluation (Elbow WCSS & Silhouette Score),
+    and clinical cluster profiling compared against cohort baselines.
     """
 
-    FEATURE_NAMES = ['age', 'avg_hemoglobin', 'avg_potassium', 'avg_uf']
+    FEATURE_NAMES = ['age', 'avg_hemoglobin', 'avg_potassium', 'avg_idwg_pct']
 
     # Clinical default baselines when lab/session history is not available
     DEFAULT_AGE = 50.0
-    DEFAULT_HEMOGLOBIN = 11.0  # g/dL normal dialysis target
-    DEFAULT_POTASSIUM = 4.5    # mEq/L normal serum potassium
-    DEFAULT_UF = 0.0           # Liters
+    DEFAULT_HEMOGLOBIN = 11.0    # g/dL normal dialysis target
+    DEFAULT_POTASSIUM = 4.5      # mmol/L normal serum potassium
+    DEFAULT_IDWG_PCT = 2.5       # % of dry weight (safe baseline IDWG)
+    DEFAULT_UF = 2.5             # Backward compatibility alias
 
     def __init__(self, department_id=None, include_discharged=False):
         self.department_id = department_id
         self.include_discharged = include_discharged
 
-    def _get_patient_features(self):
+    def _get_patient_features(self) -> List[Dict[str, Any]]:
         """
         Query Django ORM for patients and calculate 4 clinical features for each:
         - age: calculated from Patient.date_of_birth to today.
         - avg_hemoglobin: mean of BloodSample.hemoglobin_level.
         - avg_potassium: mean of BloodSample.potassium_level.
-        - avg_uf: mean of uf_actual across COMPLETED DialysisSession records.
-        By default, DISCHARGED patients are excluded unless include_discharged=True.
+        - avg_idwg_pct: mean percentage of interdialytic weight gain / UF relative to dry weight
+          from completed DialysisSession records: (pre_weight - dry_weight) / dry_weight * 100%.
+          Falls back to (uf_actual / dry_weight) * 100% if pre_weight is absent.
+        Tracks is_imputed and imputed_fields for clinical transparency.
         """
-        qs = Patient.objects.all().order_by('patient_id')
-        if not self.include_discharged:
-            qs = qs.exclude(status=Patient.Status.DISCHARGED)
+        qs = Patient.objects.all()
 
         if self.department_id is not None:
             qs = qs.filter(department_id=self.department_id)
 
-        # Prefetch related blood samples and completed sessions for query efficiency
+        if not self.include_discharged:
+            qs = qs.exclude(status=Patient.Status.DISCHARGED)
+
         qs = qs.prefetch_related('blood_samples', 'dialysis_sessions')
 
-        today = timezone.localdate()
-        features_list = []
+        today = timezone.now().date()
+        features = []
 
-        for patient in qs:
+        for p in qs:
             imputed_fields = []
-            # 1. Age
-            if patient.date_of_birth:
-                dob = patient.date_of_birth
-                age = float(
-                    today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
-                )
-                age = max(0.0, age)
+
+            # 1. Age (years)
+            if p.date_of_birth:
+                age_years = (today - p.date_of_birth).days / 365.25
+                age = round(age_years, 1)
             else:
                 age = self.DEFAULT_AGE
                 imputed_fields.append('age')
 
-            # 2 & 3. Lab indicators: Hemoglobin and Potassium
-            samples = list(patient.blood_samples.all())
-            if samples:
-                avg_hb = sum(s.hemoglobin_level for s in samples) / len(samples)
-                avg_k = sum(s.potassium_level for s in samples) / len(samples)
+            # 2 & 3. Lab tests (Hemoglobin & Potassium)
+            samples = list(p.blood_samples.all())
+            valid_hb = [s.hemoglobin_level for s in samples if s.hemoglobin_level is not None]
+            valid_k = [s.potassium_level for s in samples if s.potassium_level is not None]
+
+            if valid_hb:
+                avg_hb = round(sum(valid_hb) / len(valid_hb), 2)
             else:
                 avg_hb = self.DEFAULT_HEMOGLOBIN
-                avg_k = self.DEFAULT_POTASSIUM
-                imputed_fields.extend(['avg_hemoglobin', 'avg_potassium'])
+                imputed_fields.append('avg_hemoglobin')
 
-            # 4. Ultrafiltration (UF actual) from completed sessions
-            sessions = [
-                s for s in patient.dialysis_sessions.all()
-                if s.status == DialysisSession.Status.COMPLETED and s.uf_actual is not None
-            ]
-            if sessions:
-                avg_uf = sum(s.uf_actual for s in sessions) / len(sessions)
+            if valid_k:
+                avg_k = round(sum(valid_k) / len(valid_k), 2)
             else:
-                avg_uf = self.DEFAULT_UF
-                imputed_fields.append('avg_uf')
+                avg_k = self.DEFAULT_POTASSIUM
+                imputed_fields.append('avg_potassium')
+
+            # 4. Interdialytic Weight Gain Percentage (% IDWG)
+            # Calculated from COMPLETED dialysis sessions relative to dry weight
+            sessions = [
+                s for s in p.dialysis_sessions.all()
+                if s.status == DialysisSession.Status.COMPLETED
+            ]
+
+            dry_w = float(p.dry_weight) if p.dry_weight and p.dry_weight > 0 else 0.0
+            idwg_pct_list = []
+
+            for s in sessions:
+                pre_w = float(s.pre_weight) if s.pre_weight is not None else None
+                uf_act = float(s.uf_actual) if s.uf_actual is not None else None
+
+                if pre_w is not None and dry_w > 0:
+                    # % IDWG = max(0, pre_weight - dry_weight) / dry_weight * 100%
+                    pct = max(0.0, pre_w - dry_w) / dry_w * 100.0
+                    idwg_pct_list.append(pct)
+                elif uf_act is not None and dry_w > 0:
+                    # Approximation: UF (Liters ~ kg) / dry_weight * 100%
+                    pct = max(0.0, uf_act) / dry_w * 100.0
+                    idwg_pct_list.append(pct)
+
+            if idwg_pct_list:
+                avg_idwg = round(sum(idwg_pct_list) / len(idwg_pct_list), 2)
+            else:
+                avg_idwg = self.DEFAULT_IDWG_PCT
+                imputed_fields.append('avg_idwg_pct')
+
+            is_imputed = len(imputed_fields) > 0
 
             raw_dict = {
-                'age': round(age, 2),
-                'avg_hemoglobin': round(avg_hb, 2),
-                'avg_potassium': round(avg_k, 2),
-                'avg_uf': round(avg_uf, 2),
-                'is_imputed': len(imputed_fields) > 0,
-                'imputed_fields': imputed_fields,
+                'age': age,
+                'avg_hemoglobin': avg_hb,
+                'avg_potassium': avg_k,
+                'avg_idwg_pct': avg_idwg,
+                'avg_uf': avg_idwg,  # Backward compatibility alias
             }
-            raw_vector = [age, avg_hb, avg_k, avg_uf]
 
-            features_list.append({
-                'patient_id': patient.patient_id,
-                'full_name': patient.full_name,
-                'status': patient.status,
-                'is_imputed': len(imputed_fields) > 0,
-                'imputed_fields': imputed_fields,
+            features.append({
+                'patient_id': p.patient_id,
+                'full_name': p.full_name,
+                'dry_weight': dry_w,
                 'raw_features': raw_dict,
-                'raw_vector': raw_vector,
+                'is_imputed': is_imputed,
+                'imputed_fields': imputed_fields,
             })
 
-        return features_list
+        return features
 
-    def _normalize_data(self, features_list):
+    def _normalize_features(
+        self, patient_features: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, float]]]:
         """
-        Apply Min-Max Scaling to map all 4 features into [0, 1].
-        Keeps unrounded raw_bounds (float) for precise scaling and denormalization.
-        Returns (min_max_display, raw_bounds, features_list).
+        Pure Python Min-Max feature normalization: x_norm = (x - min) / (max - min).
+        Maps all 4 clinical features to the range [0.0, 1.0].
+        If max == min, normalized value is assigned 0.5.
+        Also calculates min_max metadata for both avg_idwg_pct and avg_uf alias.
         """
-        if not features_list:
-            return {}, {}, []
+        if not patient_features:
+            return [], {}
 
-        min_max_display = {}
-        raw_bounds = {}
-
-        for j, feat_name in enumerate(self.FEATURE_NAMES):
-            values = [p['raw_vector'][j] for p in features_list]
-            raw_min = float(min(values))
-            raw_max = float(max(values))
-            raw_bounds[feat_name] = {'min': raw_min, 'max': raw_max}
-            min_max_display[feat_name] = {
-                'min': round(raw_min, 4),
-                'max': round(raw_max, 4),
+        # 1. Find min and max for each feature
+        min_max = {}
+        all_feature_keys = ['age', 'avg_hemoglobin', 'avg_potassium', 'avg_idwg_pct', 'avg_uf']
+        for feat in all_feature_keys:
+            vals = [p['raw_features'][feat] for p in patient_features]
+            min_max[feat] = {
+                'min': min(vals),
+                'max': max(vals),
             }
 
-        # Normalize each patient vector using unrounded raw_bounds
-        for p in features_list:
+        # 2. Normalize features into a 4-dimensional mathematical vector
+        normalized = []
+        for p in patient_features:
             norm_vector = []
             norm_dict = {}
-            for j, feat_name in enumerate(self.FEATURE_NAMES):
-                raw_min = raw_bounds[feat_name]['min']
-                raw_max = raw_bounds[feat_name]['max']
-                diff = raw_max - raw_min
-                if diff > 1e-9:
-                    val = (p['raw_vector'][j] - raw_min) / diff
+            for feat in self.FEATURE_NAMES:
+                val = p['raw_features'][feat]
+                f_min = min_max[feat]['min']
+                f_max = min_max[feat]['max']
+                if math.isclose(f_max, f_min, abs_tol=1e-9):
+                    norm_val = 0.5
                 else:
-                    val = 0.5  # Neutral midpoint when all values in cohort are identical
-                norm_vector.append(val)
-                norm_dict[feat_name] = round(val, 4)
+                    norm_val = (val - f_min) / (f_max - f_min)
+                norm_vector.append(round(norm_val, 6))
+                norm_dict[feat] = round(norm_val, 6)
 
-            p['normalized_vector'] = norm_vector
-            p['normalized_features'] = norm_dict
+            # Mirror to avg_uf for backward compatibility
+            norm_dict['avg_uf'] = norm_dict['avg_idwg_pct']
 
-        return min_max_display, raw_bounds, features_list
+            normalized.append({
+                'patient_id': p['patient_id'],
+                'full_name': p['full_name'],
+                'dry_weight': p['dry_weight'],
+                'raw_features': p['raw_features'],
+                'normalized_vector': norm_vector,
+                'normalized_dict': norm_dict,
+                'is_imputed': p['is_imputed'],
+                'imputed_fields': p['imputed_fields'],
+            })
 
-    def _euclidean_distance(self, pt1, pt2):
+        return normalized, min_max
+
+    def extract_features(self) -> List[Dict[str, Any]]:
+        """
+        Extract and return normalized patient features list.
+        Convenience helper for external callers and testing.
+        """
+        raw = self._get_patient_features()
+        normalized, _ = self._normalize_features(raw)
+        return normalized
+
+    def _euclidean_distance(self, pt1: List[float], pt2: List[float]) -> float:
         """
         Compute standard Euclidean distance between two vectors using pure Python math.
         d(p, q) = sqrt(sum((p_i - q_i)^2))
         """
         return math.sqrt(sum((a - b) ** 2 for a, b in zip(pt1, pt2)))
+
+    def _init_centroids_plusplus(
+        self, features_list: List[Any], k: int, rng: random.Random
+    ) -> List[List[float]]:
+        """
+        K-Means++ initialization algorithm using pure Python standard library:
+        1. Choose the first centroid uniformly at random from data points.
+        2. For each data point x, compute D(x)^2: squared distance to the nearest already chosen centroid.
+        3. Choose the next centroid with probability proportional to D(x)^2 using cumulative sum.
+        4. Repeat until K centroids are chosen.
+        Supports both List[Dict] with 'normalized_vector' and raw List[List[float]].
+        """
+        n_points = len(features_list)
+        if n_points == 0 or k <= 0:
+            return []
+
+        def get_vec(item):
+            if isinstance(item, dict) and 'normalized_vector' in item:
+                return list(item['normalized_vector'])
+            return list(item)
+
+        if k >= n_points:
+            return [get_vec(p) for p in features_list[:k]]
+
+        # 1. First centroid chosen uniformly at random
+        first_idx = rng.randint(0, n_points - 1)
+        centroids = [get_vec(features_list[first_idx])]
+
+        # 2. Iteratively choose remaining k - 1 centroids with D^2 probability weighting
+        for _ in range(1, k):
+            dist_sq_list = []
+            for p in features_list:
+                p_vec = get_vec(p)
+                min_d_sq = min(
+                    self._euclidean_distance(p_vec, c) ** 2
+                    for c in centroids
+                )
+                dist_sq_list.append(min_d_sq)
+
+            total_weight = sum(dist_sq_list)
+            if total_weight > 1e-9:
+                rand_val = rng.uniform(0.0, total_weight)
+                cum_sum = 0.0
+                chosen_idx = 0
+                for idx, d_sq in enumerate(dist_sq_list):
+                    cum_sum += d_sq
+                    if cum_sum >= rand_val:
+                        chosen_idx = idx
+                        break
+            else:
+                # Fallback if points are all identical
+                chosen_idx = rng.randint(0, n_points - 1)
+
+            centroids.append(get_vec(features_list[chosen_idx]))
+
+        return centroids
+
+    def _cluster_iteration(
+        self,
+        features_list: List[Dict[str, Any]],
+        initial_centroids: List[List[float]],
+        max_iters: int = 100,
+    ) -> Tuple[Dict[int, List[Dict[str, Any]]], List[List[float]], int, bool]:
+        """
+        Pure Python iterative Lloyd's clustering algorithm with empty cluster safeguard.
+        Returns:
+            (clusters_dict, final_centroids, iterations_run, converged_flag)
+        """
+        centroids = [list(c) for c in initial_centroids]
+        actual_k = len(centroids)
+        converged = False
+        iteration = 0
+
+        while iteration < max_iters and not converged:
+            iteration += 1
+            clusters = {i: [] for i in range(actual_k)}
+
+            # 1. Assignment step: Assign each point to the nearest centroid
+            for p in features_list:
+                p_vec = p['normalized_vector']
+                distances = [self._euclidean_distance(p_vec, c) for c in centroids]
+                closest_c = min(range(actual_k), key=lambda idx: distances[idx])
+                clusters[closest_c].append(p)
+
+            # 2. Update step: Calculate new centroids as the mean vector of assigned points
+            new_centroids = []
+            for c_idx in range(actual_k):
+                members = clusters[c_idx]
+                if members:
+                    dim = len(centroids[c_idx])
+                    mean_vec = [
+                        sum(p['normalized_vector'][d] for p in members) / len(members)
+                        for d in range(dim)
+                    ]
+                    new_centroids.append(mean_vec)
+                else:
+                    # Empty cluster safeguard: reassign centroid to the point furthest from any populated centroid
+                    populated = [c for i, c in enumerate(centroids) if clusters[i]]
+                    furthest_point = None
+                    max_min_dist = -1.0
+                    for c_pop_idx in range(actual_k):
+                        for p in clusters[c_pop_idx]:
+                            p_vec = p['normalized_vector']
+                            min_d = min(self._euclidean_distance(p_vec, pc) for pc in populated)
+                            if min_d > max_min_dist:
+                                max_min_dist = min_d
+                                furthest_point = p_vec
+                    new_c = list(furthest_point) if furthest_point is not None else list(centroids[c_idx])
+                    new_centroids.append(new_c)
+
+            # 3. Convergence check: Centroids movement < threshold
+            shift = sum(
+                self._euclidean_distance(old_c, new_c)
+                for old_c, new_c in zip(centroids, new_centroids)
+            )
+            if shift < 1e-7:
+                converged = True
+            centroids = new_centroids
+
+        return clusters, centroids, iteration, converged
 
     def _calculate_metrics(self, clusters, centroids, actual_k, features_list):
         """
@@ -187,320 +356,346 @@ class KMeansClusteringService:
         if actual_k <= 1 or total_points <= actual_k:
             return wcss_rounded, 0.0
 
-        s_scores = []
-        for c_idx in range(actual_k):
-            members = clusters[c_idx]
-            n_members = len(members)
+        # Build point-to-cluster lookup map
+        pt_cluster_map = {}
+        for c_idx, members in clusters.items():
+            for p in members:
+                pt_cluster_map[p['patient_id']] = c_idx
 
-            if n_members <= 1:
-                # A single-point cluster has silhouette score of 0 by definition
-                for _ in members:
-                    s_scores.append(0.0)
+        s_scores = []
+        for p in features_list:
+            p_id = p['patient_id']
+            p_vec = p['normalized_vector']
+            c_own = pt_cluster_map[p_id]
+            own_members = clusters[c_own]
+
+            if len(own_members) <= 1:
+                # Single-point cluster has silhouette score of 0
+                s_scores.append(0.0)
                 continue
 
-            for p in members:
-                p_vec = p['normalized_vector']
+            # a(i): Mean distance to other points in the same cluster
+            dist_same = [
+                self._euclidean_distance(p_vec, other['normalized_vector'])
+                for other in own_members if other['patient_id'] != p_id
+            ]
+            a_i = sum(dist_same) / len(dist_same) if dist_same else 0.0
 
-                # a_i: mean intra-cluster distance to other members in C_k
-                intra_dists = [
+            # b(i): Smallest mean distance to points in any other cluster
+            b_i = float('inf')
+            for c_other, other_members in clusters.items():
+                if c_other == c_own or not other_members:
+                    continue
+                dist_other = [
                     self._euclidean_distance(p_vec, other['normalized_vector'])
-                    for other in members
-                    if other is not p
+                    for other in other_members
                 ]
-                a_i = sum(intra_dists) / len(intra_dists) if intra_dists else 0.0
+                mean_dist_other = sum(dist_other) / len(dist_other)
+                if mean_dist_other < b_i:
+                    b_i = mean_dist_other
 
-                # b_i: min mean distance to members of any other cluster C_m (m != c_idx)
-                b_i = float('inf')
-                for other_c in range(actual_k):
-                    if other_c == c_idx:
-                        continue
-                    other_members = clusters[other_c]
-                    if not other_members:
-                        continue
-                    inter_dists = [
-                        self._euclidean_distance(p_vec, om['normalized_vector'])
-                        for om in other_members
-                    ]
-                    mean_inter = sum(inter_dists) / len(inter_dists)
-                    if mean_inter < b_i:
-                        b_i = mean_inter
-
-                if b_i == float('inf'):
-                    s_i = 0.0
+            if math.isinf(b_i):
+                s_i = 0.0
+            else:
+                max_ab = max(a_i, b_i)
+                if max_ab > 1e-9:
+                    s_i = (b_i - a_i) / max_ab
                 else:
-                    max_ab = max(a_i, b_i)
-                    if max_ab > 1e-9:
-                        s_i = (b_i - a_i) / max_ab
-                    else:
-                        s_i = 0.0
+                    s_i = 0.0
 
-                s_scores.append(s_i)
+            s_scores.append(s_i)
 
         avg_silhouette = round(sum(s_scores) / len(s_scores), 4) if s_scores else 0.0
         return wcss_rounded, avg_silhouette
 
-    def _generate_cluster_summaries(self, denormalized_centroids, clusters):
+    def _evaluate_k_range(
+        self,
+        features_list: Optional[List[Dict[str, Any]]] = None,
+        min_k: int = 2,
+        max_k: int = 6,
+        seed: int = 42,
+        max_iters: int = 100,
+        **kwargs,
+    ) -> Tuple[List[Dict[str, Any]], int]:
         """
-        Generate automated clinical summaries for each cluster based on centroid values:
-        - Evaluates Age, Hemoglobin, Potassium, and UF against clinical standards.
-        - Assigns clinical tags and overall risk tier.
+        Survey multiple K values in range [min_k, max_k] to provide Elbow and Silhouette curves.
+        Returns:
+            (k_evaluations: List of {'k': int, 'wcss': float, 'silhouette_score': float},
+             recommended_k: int)
+        """
+        if features_list is None:
+            features_list = self.extract_features()
+        if 'k_min' in kwargs:
+            min_k = kwargs['k_min']
+        if 'k_max' in kwargs:
+            max_k = kwargs['k_max']
+
+        n_points = len(features_list)
+        if n_points < 3:
+            return [], min(max(1, n_points), 3)
+
+        upper_bound = min(max_k, n_points - 1)
+        lower_bound = min(min_k, upper_bound)
+        candidate_ks = list(range(lower_bound, upper_bound + 1))
+
+        k_evaluations = []
+        best_k = candidate_ks[0] if candidate_ks else 3
+        best_silhouette = -2.0
+
+        for test_k in candidate_ks:
+            rng = random.Random(seed)
+            init_c = self._init_centroids_plusplus(features_list, test_k, rng)
+            cls, cnts, _, _ = self._cluster_iteration(features_list, init_c, max_iters=max_iters)
+            wcss, sil = self._calculate_metrics(cls, cnts, test_k, features_list)
+
+            k_evaluations.append({
+                'k': test_k,
+                'wcss': wcss,
+                'silhouette_score': sil,
+            })
+
+            # Recommend K that maximizes Silhouette Score
+            if sil > best_silhouette:
+                best_silhouette = sil
+                best_k = test_k
+
+        return k_evaluations, best_k
+
+    def _denormalize_centroids(
+        self, centroids: List[List[float]], min_max: Dict[str, Dict[str, float]]
+    ) -> List[Dict[str, float]]:
+        """
+        Convert normalized centroid coordinates back to clinical unit scales.
+        Includes both avg_idwg_pct and avg_uf alias.
+        """
+        denorm = []
+        for c_vec in centroids:
+            c_dict = {}
+            for idx, feat in enumerate(self.FEATURE_NAMES):
+                val_norm = c_vec[idx]
+                f_min = min_max[feat]['min']
+                f_max = min_max[feat]['max']
+                real_val = f_min + val_norm * (f_max - f_min)
+                c_dict[feat] = round(real_val, 2)
+            c_dict['avg_uf'] = c_dict['avg_idwg_pct']
+            denorm.append(c_dict)
+        return denorm
+
+    def _generate_cluster_summaries(
+        self,
+        clusters: Dict[int, List[Dict[str, Any]]],
+        denorm_centroids: List[Dict[str, float]],
+        cohort_means: Dict[str, float],
+    ) -> List[Dict[str, Any]]:
+        """
+        Generate statistical cluster profiles comparing centroid metrics against
+        both the cohort average and clinical target thresholds:
+        - Target Hemoglobin: 10.0 - 11.5 g/dL (KDIGO)
+        - Target Potassium: <= 5.0 mmol/L
+        - Target IDWG: <= 3.5% dry weight
         """
         summaries = []
-        for c_idx, denorm in enumerate(denormalized_centroids):
-            age = denorm.get('age', self.DEFAULT_AGE)
-            hb = denorm.get('avg_hemoglobin', self.DEFAULT_HEMOGLOBIN)
-            k_val = denorm.get('avg_potassium', self.DEFAULT_POTASSIUM)
-            uf = denorm.get('avg_uf', self.DEFAULT_UF)
 
-            tags = []
-            risk_points = 0
+        for c_idx, centroid in enumerate(denorm_centroids):
+            pts = clusters.get(c_idx, [])
+            pt_count = len(pts)
 
-            # Age evaluation
-            if age < 45:
-                age_label = 'Trẻ tuổi (<45)'
-            elif age <= 65:
-                age_label = 'Trung niên (45-65)'
-            else:
-                age_label = 'Cao tuổi (>65)'
-                risk_points += 1
-            tags.append(age_label)
+            age_val = centroid.get('age', 0.0)
+            hb_val = centroid.get('avg_hemoglobin', 0.0)
+            k_val = centroid.get('avg_potassium', 0.0)
+            idwg_val = centroid.get('avg_idwg_pct', centroid.get('avg_uf', 0.0))
 
-            # Hemoglobin evaluation (Normal hemodialysis target: 10 - 12 g/dL)
-            if hb < 9.5:
-                hb_label = 'Thiếu máu nặng (Hb < 9.5)'
-                risk_points += 2
-            elif hb < 11.0:
-                hb_label = 'Thiếu máu nhẹ (Hb 9.5-11)'
-                risk_points += 1
-            else:
-                hb_label = 'Hemoglobin đạt mục tiêu (Hb >= 11)'
-            tags.append(hb_label)
+            mean_age = cohort_means.get('age', 50.0)
+            mean_hb = cohort_means.get('avg_hemoglobin', 11.0)
+            mean_k = cohort_means.get('avg_potassium', 4.5)
+            mean_idwg = cohort_means.get('avg_idwg_pct', cohort_means.get('avg_uf', 2.5))
 
-            # Potassium evaluation (Normal serum K: 3.5 - 5.0 mEq/L)
-            if k_val < 3.5:
-                k_label = 'Hạ kali máu (<3.5)'
-                risk_points += 1
+            # Build clinical contrast descriptions
+            traits = []
+            if age_val > mean_age + 5.0:
+                traits.append('tuổi cao hơn TB')
+            elif age_val < mean_age - 5.0:
+                traits.append('tuổi trẻ hơn TB')
+
+            if hb_val < 10.0 or hb_val < mean_hb - 1.0:
+                traits.append('Hb thấp (thiếu máu)')
+            elif hb_val >= 11.5:
+                traits.append('Hb ổn định')
+
+            if k_val >= 5.5 or k_val > mean_k + 0.5:
+                traits.append('Kali huyết cao')
             elif k_val <= 5.0:
-                k_label = 'Kali ổn định (3.5-5.0)'
-            elif k_val <= 6.0:
-                k_label = 'Tăng kali vừa (5.0-6.0)'
-                risk_points += 2
-            else:
-                k_label = 'Tăng kali nguy hiểm (>6.0)'
-                risk_points += 3
-            tags.append(k_label)
+                traits.append('Kali huyết bình thường')
 
-            # Ultrafiltration evaluation
-            if uf < 2.0:
-                uf_label = 'Siêu lọc thấp (UF < 2.0L)'
-            elif uf <= 3.5:
-                uf_label = 'Siêu lọc trung bình (UF 2.0-3.5L)'
-                risk_points += 1
-            else:
-                uf_label = 'Rút dịch nhiều (UF > 3.5L)'
-                risk_points += 2
-            tags.append(uf_label)
+            if idwg_val >= 4.5 or idwg_val > mean_idwg + 1.0:
+                traits.append('tăng cân gian lọc cao (%IDWG cao)')
+            elif idwg_val <= 3.0:
+                traits.append('%IDWG kiểm soát tốt')
 
-            if risk_points >= 4:
+            label_traits = ', '.join(traits) if traits else 'chỉ số trung bình'
+            cluster_label = f'Cụm {c_idx + 1}: {label_traits}'
+
+            # Risk level and neutral recommendations
+            if k_val >= 5.5 or idwg_val >= 4.5 or hb_val < 9.0:
                 risk_level = 'HIGH'
-            elif risk_points >= 2:
+                recommendation = (
+                    f'Nhóm cần chú ý lâm sàng: %IDWG TB {idwg_val:.1f}%, '
+                    f'Kali TB {k_val:.2f} mmol/L, Hb TB {hb_val:.1f} g/dL. '
+                    'Khuyến nghị đánh giá lại cân nặng khô và tư vấn chế độ ăn giảm Kali.'
+                )
+            elif hb_val < 10.5 or k_val > 5.0 or idwg_val > 3.5:
                 risk_level = 'MEDIUM'
+                recommendation = (
+                    f'Nhóm mức độ nguy cơ trung bình: %IDWG TB {idwg_val:.1f}%, '
+                    f'Kali TB {k_val:.2f} mmol/L, Hb TB {hb_val:.1f} g/dL. '
+                    'Khuyến nghị theo dõi định kỳ cân nặng và xét nghiệm máu.'
+                )
             else:
                 risk_level = 'LOW'
-
-            summary_tag_str = ', '.join(tags[:2]) if tags else 'Chung'
-            cluster_label = f'Cụm {c_idx + 1} — Phân nhóm đặc trưng {summary_tag_str}'
-            clinical_recommendation = (
-                f'Đặc trưng thống kê trung tâm cụm: Tuổi TB {age:.1f}, Hb TB {hb:.1f} g/dL, '
-                f'Kali TB {k_val:.2f} mEq/L, UF TB {uf:.2f} L. Kết quả phân nhóm nhằm mục đích '
-                f'tham khảo quản lý và theo dõi xu hướng thuần túy thống kê.'
-            )
+                recommendation = (
+                    f'Nhóm tương đối ổn định: %IDWG TB {idwg_val:.1f}%, '
+                    f'Kali TB {k_val:.2f} mmol/L, Hb TB {hb_val:.1f} g/dL. '
+                    'Duy trì phác đồ lọc máu và chế độ dinh dưỡng hiện tại.'
+                )
 
             summaries.append({
                 'cluster_id': c_idx,
                 'cluster_label': cluster_label,
-                'patient_count': len(clusters.get(c_idx, [])),
+                'patient_count': pt_count,
                 'risk_level': risk_level,
-                'tags': tags,
-                'recommendation': clinical_recommendation,
-                'centroid': denorm,
+                'recommendation': recommendation,
+                'centroid': centroid,
             })
 
         return summaries
 
-    def run_kmeans(self, k=3, max_iters=100, seed=42):
+    def run_kmeans(
+        self,
+        k: int = 3,
+        max_iters: int = 100,
+        seed: int = 42,
+        min_k: int = 2,
+        max_k: int = 6,
+    ) -> Dict[str, Any]:
         """
-        Core iterative K-Means algorithm using pure Python:
-        1. Fetch patient features (excluding DISCHARGED by default).
-        2. Normalize features using Min-Max scaling with unrounded bounds.
-        3. Seed random generator and sample K initial centroids.
-        4. Loop: Assign clusters -> Update centroids -> Check convergence.
-        5. Compute WCSS and Silhouette Score.
-        6. Generate clinical cluster summaries.
-        7. Return structured clusters, centroids, metrics, and metadata.
+        Execute full pure Python K-Means workflow:
+        1. Query patient records and extract 4 clinical features.
+        2. Min-Max normalize features to [0.0, 1.0].
+        3. Evaluate K range [min_k, max_k] using K-Means++ and compute Elbow (WCSS) & Silhouette curves.
+        4. Initialize K centroids with K-Means++ (D^2 weighting) for requested K.
+        5. Iteratively run Lloyd's algorithm with empty-cluster safeguards until convergence.
+        6. Compute WCSS and Silhouette Score.
+        7. Denormalize centroids and generate clinical profile summaries.
+        8. Return comprehensive payload for UI visualization.
         """
-        features_list = self._get_patient_features()
-        n_points = len(features_list)
+        raw_features = self._get_patient_features()
+        n_points = len(raw_features)
 
-        # Handle empty cohort edge case
         if n_points == 0:
             return {
-                'success': True,
-                'k_value': 0,
-                'seed': seed,
-                'wcss': 0.0,
-                'silhouette_score': 0.0,
+                'success': False,
+                'error': 'Không có dữ liệu bệnh nhân nào để thực hiện phân cụm.',
+                'patients': [],
+                'clusters': {},
                 'centroids': [],
                 'denormalized_centroids': [],
-                'cluster_summaries': [],
                 'min_max': {},
-                'clusters': {},
-                'patients': [],
-                'iterations': 0,
-                'converged': True,
-                'disclaimer': (
-                    'Kết quả phân cụm K-Means chỉ phản ánh độ tương đồng dữ liệu thống kê, '
-                    'dùng để tham khảo phân nhóm quản lý, không thay thế chẩn đoán lâm sàng của bác sĩ.'
-                ),
+                'wcss': 0.0,
+                'silhouette_score': 0.0,
+                'cluster_summaries': [],
+                'k_evaluation': [],
+                'recommended_k': 3,
+                'k_value': 0,
+                'total_patients': 0,
             }
 
-        # Constrain K to number of available data points
-        actual_k = min(max(1, int(k)), n_points)
+        # Constrain K to valid range
+        actual_k = max(1, min(k, n_points))
 
-        min_max_display, raw_bounds, features_list = self._normalize_data(features_list)
+        # Min-Max normalize
+        normalized_features, min_max = self._normalize_features(raw_features)
 
-        # Initialize centroids randomly from data points with deterministic seed
+        # Multi-K evaluation for Elbow & Silhouette curves
+        k_evaluations, recommended_k = self._evaluate_k_range(
+            normalized_features,
+            min_k=min_k,
+            max_k=max_k,
+            seed=seed,
+            max_iters=max_iters,
+        )
+
+        # Run K-Means for the requested K
         rng = random.Random(seed)
-        chosen_indices = rng.sample(range(n_points), actual_k)
-        centroids = [list(features_list[idx]['normalized_vector']) for idx in chosen_indices]
+        initial_centroids = self._init_centroids_plusplus(normalized_features, actual_k, rng)
 
-        iteration = 0
-        converged = False
-        clusters = {c: [] for c in range(actual_k)}
+        clusters, final_centroids, iterations, converged = self._cluster_iteration(
+            normalized_features,
+            initial_centroids,
+            max_iters=max_iters,
+        )
 
-        while iteration < max_iters and not converged:
-            iteration += 1
+        # Compute evaluation metrics
+        wcss, silhouette = self._calculate_metrics(
+            clusters, final_centroids, actual_k, normalized_features
+        )
 
-            # 1. Assignment step: Assign each patient to closest centroid
-            clusters = {c: [] for c in range(actual_k)}
-            for p in features_list:
-                p_vec = p['normalized_vector']
-                best_c = 0
-                min_dist = float('inf')
-                for c_idx, c_vec in enumerate(centroids):
-                    dist = self._euclidean_distance(p_vec, c_vec)
-                    if dist < min_dist:
-                        min_dist = dist
-                        best_c = c_idx
-                p['cluster_id'] = best_c
-                clusters[best_c].append(p)
+        # Denormalize centroids
+        denorm_centroids = self._denormalize_centroids(final_centroids, min_max)
 
-            # 2. Update step: Recalculate centroids as cluster means
-            new_centroids = []
-            dim = len(self.FEATURE_NAMES)
-            for c_idx in range(actual_k):
-                members = clusters[c_idx]
-                if members:
-                    new_c = [
-                        sum(m['normalized_vector'][d] for m in members) / len(members)
-                        for d in range(dim)
-                    ]
-                else:
-                    # Empty cluster safeguard: retain previous centroid
-                    # Empty cluster safeguard: reassign centroid to the point furthest from populated centroids
-                    furthest_point = None
-                    max_min_dist = -1.0
-                    populated = [
-                        [sum(m['normalized_vector'][d] for m in clusters[ci]) / len(clusters[ci]) for d in range(dim)]
-                        for ci in range(actual_k) if clusters[ci]
-                    ]
-                    if populated:
-                        for p in features_list:
-                            p_vec = p['normalized_vector']
-                            min_d = min(self._euclidean_distance(p_vec, pc) for pc in populated)
-                            if min_d > max_min_dist:
-                                max_min_dist = min_d
-                                furthest_point = p_vec
-                    new_c = list(furthest_point) if furthest_point is not None else list(centroids[c_idx])
-                new_centroids.append(new_c)
+        # Calculate cohort means
+        cohort_means = {}
+        for feat in ['age', 'avg_hemoglobin', 'avg_potassium', 'avg_idwg_pct', 'avg_uf']:
+            vals = [p['raw_features'][feat] for p in normalized_features]
+            cohort_means[feat] = round(sum(vals) / len(vals), 2) if vals else 0.0
 
-            # 3. Convergence check: Centroids movement < threshold
-            shift = sum(
-                self._euclidean_distance(old_c, new_c)
-                for old_c, new_c in zip(centroids, new_centroids)
-            )
-            if shift < 1e-7:
-                converged = True
-            centroids = new_centroids
+        # Generate cluster summaries
+        cluster_summaries = self._generate_cluster_summaries(
+            clusters, denorm_centroids, cohort_means
+        )
 
-        # Calculate denormalized centroids in original clinical units using unrounded raw_bounds
-        denormalized_centroids = []
-        for c in centroids:
-            denorm = {}
-            for d, feat_name in enumerate(self.FEATURE_NAMES):
-                raw_min = raw_bounds[feat_name]['min']
-                raw_max = raw_bounds[feat_name]['max']
-                diff = raw_max - raw_min
-                if diff > 1e-9:
-                    val = c[d] * diff + raw_min
-                else:
-                    val = raw_min
-                denorm[feat_name] = round(val, 2)
-            denormalized_centroids.append(denorm)
-
-        centroids_rounded = [[round(coord, 4) for coord in c] for c in centroids]
-
-        # Calculate evaluation metrics: WCSS & Silhouette Score
-        wcss, silhouette = self._calculate_metrics(clusters, centroids, actual_k, features_list)
-
-        # Generate clinical cluster summaries
-        cluster_summaries = self._generate_cluster_summaries(denormalized_centroids, clusters)
-
-        # Format output clusters (string keys for JSON compatibility)
+        # Format cluster patient lists
         clusters_output = {}
+        patients_output = []
+
         for c_idx in range(actual_k):
-            clusters_output[str(c_idx)] = [
-                {
+            members = clusters[c_idx]
+            member_ids = []
+            for p in members:
+                p_copy = {
                     'patient_id': p['patient_id'],
                     'full_name': p['full_name'],
-                    'cluster_id': c_idx,
-                    'status': p['status'],
-                    'is_imputed': p.get('is_imputed', False),
-                    'imputed_fields': p.get('imputed_fields', []),
-                    'features': p['raw_features'],
-                    'normalized_features': p['normalized_features'],
+                    'dry_weight': p['dry_weight'],
+                    'raw_features': p['raw_features'],
+                    'normalized_vector': p['normalized_vector'],
+                    'normalized_dict': p['normalized_dict'],
+                    'cluster': c_idx,
+                    'is_imputed': p['is_imputed'],
+                    'imputed_fields': p['imputed_fields'],
                 }
-                for p in clusters[c_idx]
-            ]
+                member_ids.append(p['patient_id'])
+                patients_output.append(p_copy)
+            clusters_output[c_idx] = member_ids
 
         return {
             'success': True,
             'k_value': actual_k,
-            'seed': seed,
+            'iterations': iterations,
+            'converged': converged,
             'wcss': wcss,
             'silhouette_score': silhouette,
-            'centroids': centroids_rounded,
-            'denormalized_centroids': denormalized_centroids,
+            'min_max': min_max,
+            'centroids': final_centroids,
+            'denormalized_centroids': denorm_centroids,
+            'cohort_means': cohort_means,
             'cluster_summaries': cluster_summaries,
-            'min_max': min_max_display,
+            'k_evaluation': k_evaluations,
+            'recommended_k': recommended_k,
             'clusters': clusters_output,
-            'patients': [
-                {
-                    'patient_id': p['patient_id'],
-                    'full_name': p['full_name'],
-                    'cluster_id': p['cluster_id'],
-                    'status': p['status'],
-                    'is_imputed': p.get('is_imputed', False),
-                    'imputed_fields': p.get('imputed_fields', []),
-                    'features': p['raw_features'],
-                    'normalized_features': p['normalized_features'],
-                }
-                for p in features_list
-            ],
-            'iterations': iteration,
-            'converged': converged,
+            'patients': patients_output,
+            'total_patients': n_points,
+            'seed': seed,
             'disclaimer': (
-                'Kết quả phân cụm K-Means chỉ phản ánh độ tương đồng dữ liệu thống kê, '
-                'dùng để tham khảo phân nhóm quản lý, không thay thế chẩn đoán lâm sàng của bác sĩ.'
+                'Kết quả phân cụm hỗ trợ tham khảo chuyên môn, '
+                'không thay thế chỉ định điều trị của bác sĩ chuyên khoa.'
             ),
         }

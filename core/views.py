@@ -607,6 +607,8 @@ class KMeansReportView(APIView):
             ),
             'wcss': result['wcss'],
             'silhouette_score': result['silhouette_score'],
+            'k_evaluation': result.get('k_evaluation', []),
+            'recommended_k': result.get('recommended_k', result['k_value']),
             'centroids': result['centroids'],
             'denormalized_centroids': result.get('denormalized_centroids', []),
             'cluster_summaries': result.get('cluster_summaries', []),
