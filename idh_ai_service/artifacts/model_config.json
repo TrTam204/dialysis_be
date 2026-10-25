@@ -1,15 +1,16 @@
 {
-  "input_dim": 7,
+  "input_dim": 8,
   "hidden_dim": 64,
   "num_layers": 2,
-  "sequence_length": 5,
+  "sequence_length": 3,
   "feature_names": [
     "systolic_bp",
     "diastolic_bp",
     "map",
+    "sbp_drop_from_baseline",
     "heart_rate",
-    "uf_rate",
-    "cumulative_uf",
+    "ufr_ml_kg_h",
+    "cumulative_uf_pct",
     "time_elapsed_min"
   ]
 }

@@ -19,7 +19,7 @@ class IDHLSTMNet(nn.Module):
 
     def __init__(
         self,
-        input_dim: int = 7,
+        input_dim: int = 8,
         hidden_dim: int = 64,
         num_layers: int = 2,
         dropout: float = 0.2,
@@ -71,7 +71,7 @@ class IDHInferencePipeline:
     """
     Production inference pipeline:
     - Preprocesses raw vital signs time-series sequences.
-    - Scales features using training distribution parameters.
+    - Scales 8 features using training distribution parameters.
     - Runs PyTorch forward inference on CPU.
     - Synthesizes physiological contributing factors and clinical action recommendations.
     """
@@ -80,9 +80,10 @@ class IDHInferencePipeline:
         'systolic_bp',
         'diastolic_bp',
         'map',
+        'sbp_drop_from_baseline',
         'heart_rate',
-        'uf_rate',
-        'cumulative_uf',
+        'ufr_ml_kg_h',
+        'cumulative_uf_pct',
         'time_elapsed_min',
     ]
 
@@ -133,12 +134,14 @@ class IDHInferencePipeline:
         self,
         vitals_list: List[Dict[str, Any]],
         threshold: float = 0.50,
+        dry_weight: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Run inference on a sequence of vital signs.
         Args:
             vitals_list: List of dicts representing consecutive time steps.
             threshold: Probability threshold for binary IDH prediction.
+            dry_weight: Patient dry weight in kg (for UFR and cumulative UF normalization).
         Returns:
             Dict containing risk_probability, risk_level, contributing factors, recommendations.
         """
@@ -149,19 +152,52 @@ class IDHInferencePipeline:
         if n_steps < 3:
             raise ValueError(f"Sequence length must be at least 3 time steps, got {n_steps}.")
 
-        # Convert dicts to 2D numpy array
+        # Determine reference baseline SBP from first step
+        base_sbp = float(vitals_list[0].get('systolic_bp', 120.0))
+
+        # Determine patient dry weight
+        resolved_dry_weight = float(dry_weight or vitals_list[0].get('dry_weight') or 60.0)
+        if resolved_dry_weight <= 0:
+            resolved_dry_weight = 60.0
+
+        # Convert dicts to 8-dimensional numpy array
         raw_matrix = []
         for step in vitals_list:
             sbp = float(step.get('systolic_bp', 120.0))
             dbp = float(step.get('diastolic_bp', 75.0))
+
+            # MAP calculation
             raw_map = step.get('map')
             map_val = float(raw_map) if raw_map is not None else float(dbp + (sbp - dbp) / 3.0)
+
+            # SBP drop from baseline
+            raw_drop = step.get('sbp_drop_from_baseline')
+            sbp_drop = float(raw_drop) if raw_drop is not None else float(base_sbp - sbp)
+
             hr = float(step.get('heart_rate', 75.0))
-            ufr = float(step.get('uf_rate', 0.8))
-            cum_uf = float(step.get('cumulative_uf', 1.0))
+
+            # UFR normalized to dry weight (mL/kg/h)
+            if step.get('ufr_ml_kg_h') is not None:
+                ufr_norm = float(step['ufr_ml_kg_h'])
+            elif step.get('uf_rate') is not None:
+                # Convert L/h to mL/kg/h
+                ufr_norm = (float(step['uf_rate']) * 1000.0) / resolved_dry_weight
+            else:
+                ufr_norm = 10.0
+
+            # Cumulative UF as % of dry weight
+            if step.get('cumulative_uf_pct') is not None:
+                cum_uf_pct = float(step['cumulative_uf_pct'])
+            elif step.get('cumulative_uf') is not None:
+                cum_uf_pct = (float(step['cumulative_uf']) / resolved_dry_weight) * 100.0
+            else:
+                cum_uf_pct = 2.0
+
             t_min = float(step.get('time_elapsed_min', 0))
 
-            raw_matrix.append([sbp, dbp, map_val, hr, ufr, cum_uf, t_min])
+            raw_matrix.append([
+                sbp, dbp, map_val, sbp_drop, hr, ufr_norm, cum_uf_pct, t_min
+            ])
 
         raw_array = np.array(raw_matrix, dtype=np.float32)
 
@@ -178,7 +214,7 @@ class IDHInferencePipeline:
         # Risk classification
         if prob < 0.30:
             risk_level = "LOW"
-        elif prob < 0.65:
+        elif prob < 0.60:
             risk_level = "MEDIUM"
         else:
             risk_level = "HIGH"
@@ -200,37 +236,52 @@ class IDHInferencePipeline:
         }
 
     def _analyze_factors(self, raw_array: np.ndarray) -> List[str]:
-        """Examine trajectory for specific clinical alert triggers."""
+        """Examine trajectory across 8 dynamic clinical features."""
         factors = []
         sbp_values = raw_array[:, 0]
         map_values = raw_array[:, 2]
-        hr_values = raw_array[:, 3]
-        ufr_values = raw_array[:, 4]
+        sbp_drop_values = raw_array[:, 3]
+        hr_values = raw_array[:, 4]
+        ufr_values = raw_array[:, 5]        # mL/kg/h
+        cum_uf_pct_values = raw_array[:, 6]  # % of dry weight
 
-        # SBP trajectory drop
-        sbp_drop = sbp_values[0] - sbp_values[-1]
-        if sbp_drop >= 15.0:
-            factors.append(f"Huyết áp tâm thu có xu hướng giảm nhanh ({sbp_drop:.1f} mmHg trong các bước vừa qua).")
-        if sbp_values[-1] < 100.0:
-            factors.append(f"Huyết áp tâm thu hiện tại thấp gần ngưỡng tụt ({sbp_values[-1]:.0f} mmHg).")
+        latest_sbp = sbp_values[-1]
+        latest_map = map_values[-1]
+        latest_drop = sbp_drop_values[-1]
+        latest_ufr = ufr_values[-1]
+        latest_cum_pct = cum_uf_pct_values[-1]
 
-        # MAP threshold
-        if map_values[-1] < 72.0:
-            factors.append(f"Huyết áp động mạch trung bình (MAP) thấp ({map_values[-1]:.1f} mmHg).")
+        # 1. SBP Drop from baseline
+        if latest_drop >= 25.0:
+            factors.append(f"Huyết áp tâm thu sụt giảm nghiêm trọng ({latest_drop:.1f} mmHg so với đầu ca).")
+        elif latest_drop >= 15.0:
+            factors.append(f"Huyết áp tâm thu có xu hướng giảm nhanh ({latest_drop:.1f} mmHg so với đầu ca).")
 
-        # Ultrafiltration intensity
-        if ufr_values[-1] >= 1.2:
-            factors.append(f"Tốc độ rút nước (UFR) cao ({ufr_values[-1]:.2f} L/h), làm tăng nguy cơ giảm thể tích nội mạch.")
+        # 2. SBP and MAP absolute low
+        if latest_sbp < 95.0:
+            factors.append(f"Huyết áp tâm thu hiện tại thấp gần ngưỡng tụt ({latest_sbp:.0f} mmHg).")
+        if latest_map < 72.0:
+            factors.append(f"Huyết áp động mạch trung bình (MAP) thấp nguy hiểm ({latest_map:.1f} mmHg).")
 
-        # Heart rate dynamics
+        # 3. Normalized Ultrafiltration Intensity
+        if latest_ufr >= 13.0:
+            factors.append(f"Tốc độ siêu lọc rất cao ({latest_ufr:.1f} mL/kg/h > 13 mL/kg/h), vượt ngưỡng an toàn tim mạch.")
+        elif latest_ufr >= 11.5:
+            factors.append(f"Tốc độ siêu lọc cao ({latest_ufr:.1f} mL/kg/h), tăng nguy cơ giảm thể tích lòng mạch.")
+
+        # 4. Cumulative UF percentage
+        if latest_cum_pct >= 4.5:
+            factors.append(f"Lượng dịch đã rút tích lũy cao ({latest_cum_pct:.1f}% trọng lượng khô).")
+
+        # 5. Heart rate dynamics
         hr_change = hr_values[-1] - hr_values[0]
         if hr_change > 15:
-            factors.append(f"Nhịp tim tăng nhanh bù trừ ({hr_values[-1]:.0f} bpm).")
-        elif hr_change < -10 and sbp_drop > 10:
+            factors.append(f"Nhịp tim tăng nhanh bù trừ ({hr_values[-1]:.0f} bpm, tăng {hr_change:.0f} bpm).")
+        elif hr_change < -10 and latest_drop > 10:
             factors.append("Hiện tượng nhịp tim chậm nghịch lý kết hợp tụt huyết áp (nghi ngờ phản xạ Bezold-Jarisch).")
 
         if not factors:
-            factors.append("Các chỉ số sinh hiệu và tốc độ siêu lọc trong giới hạn ổn định thường quy.")
+            factors.append("Các chỉ số sinh hiệu và tốc độ siêu lọc trong giới hạn dung nạp sinh lý ổn định.")
 
         return factors
 
@@ -239,15 +290,15 @@ class IDHInferencePipeline:
         if risk_level == "HIGH":
             return [
                 "CẢNH BÁO CAO: Chuẩn bị xử trí tụt huyết áp theo phác đồ cấp cứu trung tâm.",
-                "Giảm tốc độ rút nước siêu lọc (UF rate) hoặc tạm dừng siêu lọc ngay lập tức.",
-                "Đặt bệnh nhân ở tư thế nằm đầu thấp (Trendelenburg) nếu không có chống chỉ định khó thở.",
+                "Giảm ngay tốc độ siêu lọc (UF rate) hoặc tạm dừng siêu lọc (UF = 0).",
+                "Đặt bệnh nhân ở tư thế nằm đầu thấp (Trendelenburg) nếu không có khó thở cấp.",
                 "Chuẩn bị bolus 100 - 200 mL NaCl 0.9% qua đường tuần hoàn ngoài cơ thể.",
                 "Đo lại huyết áp mỗi 5 - 10 phút và báo ngay cho Bác sĩ phụ trách ca lọc.",
             ]
         elif risk_level == "MEDIUM":
             return [
                 "NGUY CƠ TRUNG BÌNH: Tăng cường tần suất theo dõi huyết áp (mỗi 15 phút).",
-                "Xem xét điều chỉnh giảm tốc độ siêu lọc (UF rate) về mức an toàn hơn.",
+                "Xem xét điều chỉnh giảm tốc độ siêu lọc (UF rate) về mức an toàn (< 10-11 mL/kg/h).",
                 "Cân nhắc hạ nhiệt độ dịch lọc (Dialysate temperature) xuống 35.5 - 36.0 °C để kích hoạt co mạch ngoại vi.",
                 "Nhắc nhở người bệnh thông báo ngay cho điều dưỡng nếu xuất hiện triệu chứng hoa mắt, chóng mặt, buồn nôn hoặc ngáp.",
             ]

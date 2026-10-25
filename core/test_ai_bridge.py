@@ -62,7 +62,7 @@ class AIBridgeTests(APITestCase):
         self.now = timezone.now()
 
     def test_01_session_without_vitals_returns_insufficient_data(self):
-        """When session has 0 vital signs, API must return INSUFFICIENT_DATA without crashing."""
+        """When session has 0 or 1 vital sign, API must return INSUFFICIENT_DATA without crashing."""
         session = DialysisSession.objects.create(
             session_id='SS-AIB-NO-VITALS',
             patient=self.patient,
@@ -78,10 +78,13 @@ class AIBridgeTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertFalse(response.data['has_prediction'])
         self.assertEqual(response.data['status'], 'INSUFFICIENT_DATA')
-        self.assertIn('Cần ít nhất 1 lần đo sinh hiệu', response.data['message'])
+        self.assertIn('Cần tối thiểu 2 lần đo sinh hiệu', response.data['message'])
 
     def test_02_session_with_one_or_two_vitals_applies_left_padding(self):
-        """When session has 1 or 2 vital signs, bridge applies left-padding to satisfy LSTM length."""
+        """
+        When session has 1 vital sign, returns INSUFFICIENT_DATA.
+        When session has 2 vital signs, bridge applies linear midpoint interpolation.
+        """
         session = DialysisSession.objects.create(
             session_id='SS-AIB-PADDED',
             patient=self.patient,
@@ -90,7 +93,8 @@ class AIBridgeTests(APITestCase):
             scheduled_end=self.now + timedelta(hours=4),
             status=DialysisSession.Status.IN_PROGRESS,
         )
-        VitalSign.objects.create(
+        # 1 vital sign: insufficient
+        v1 = VitalSign.objects.create(
             session=session,
             recorded_by=self.doctor,
             recorded_at=self.now,
@@ -100,13 +104,27 @@ class AIBridgeTests(APITestCase):
         )
 
         self.client.force_authenticate(user=self.doctor)
-        response = self.client.get(f'/api/sessions/{session.session_id}/idh-prediction/')
+        res1 = self.client.get(f'/api/sessions/{session.session_id}/idh-prediction/')
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+        self.assertFalse(res1.data['has_prediction'])
+        self.assertEqual(res1.data['status'], 'INSUFFICIENT_DATA')
 
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertTrue(response.data['has_prediction'])
-        self.assertTrue(response.data['is_padded'])
-        self.assertEqual(response.data['recorded_vitals_count'], 1)
-        self.assertIn(response.data['risk_level'], {'LOW', 'MEDIUM', 'HIGH'})
+        # Add 2nd vital sign: now triggers midpoint interpolation and prediction
+        VitalSign.objects.create(
+            session=session,
+            recorded_by=self.doctor,
+            recorded_at=self.now + timedelta(minutes=30),
+            systolic_bp=126,
+            diastolic_bp=78,
+            heart_rate=76,
+        )
+
+        res2 = self.client.get(f'/api/sessions/{session.session_id}/idh-prediction/')
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.assertTrue(res2.data['has_prediction'])
+        self.assertTrue(res2.data['is_interpolated'])
+        self.assertEqual(res2.data['recorded_vitals_count'], 2)
+        self.assertIn(res2.data['risk_level'], {'LOW', 'MEDIUM', 'HIGH'})
 
     def test_03_stable_vitals_trajectory_predicts_low_risk(self):
         """Stable vital signs throughout session must yield LOW risk probability."""

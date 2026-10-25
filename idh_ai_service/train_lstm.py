@@ -1,9 +1,9 @@
 """
 Training Pipeline for Hemodialysis Intradialytic Hypotension (IDH) LSTM Model.
 Calculates Accuracy, Precision, Recall, F1-score, and Loss across Train/Validation/Test sets,
-and saves model weights and metadata into artifacts/ directory.
+and records 100% real training history per epoch into artifacts/evaluation_metrics.json.
 """
-from typing import Dict, Any
+from typing import Dict, Any, List
 import json
 import os
 import random
@@ -87,7 +87,7 @@ def evaluate_dataset(
 
 
 def train_idh_lstm(
-    n_sessions: int = 1500,
+    n_sessions: int = 1200,
     epochs: int = 30,
     batch_size: int = 64,
     learning_rate: float = 0.001,
@@ -96,24 +96,27 @@ def train_idh_lstm(
     seed: int = 42,
     artifacts_dir: str = None,
 ) -> Dict[str, Any]:
-    """Full training pipeline with checkpointing and evaluation metrics export."""
+    """Full training pipeline with checkpointing, real per-epoch history, and evaluation metrics export."""
     set_seed(seed)
 
     if artifacts_dir is None:
         artifacts_dir = os.path.join(os.path.dirname(__file__), 'artifacts')
     os.makedirs(artifacts_dir, exist_ok=True)
 
-    print(f"[1/4] Generating hemodialysis time-series data ({n_sessions} sessions)...")
-    (X_train, y_train), (X_val, y_val), (X_test, y_test), scaler_dict = prepare_dataset_splits(
-        n_sessions=n_sessions, seed=seed
+    print(f"[1/4] Generating hemodialysis time-series data with Zero Data Leakage ({n_sessions} sessions)...")
+    (X_train, y_train), (X_val, y_val), (X_test, y_test), scaler_dict, split_metadata = prepare_dataset_splits(
+        n_sessions=n_sessions, seed=seed, seq_len=3
     )
 
-    print(f"      Train samples: {len(X_train)} | Val samples: {len(X_val)} | Test samples: {len(X_test)}")
+    print(f"      Train: {split_metadata['train_sessions']} sessions ({len(X_train)} windows, pos_rate={split_metadata['positive_rate_train']:.2%})")
+    print(f"      Val:   {split_metadata['val_sessions']} sessions ({len(X_val)} windows, pos_rate={split_metadata['positive_rate_val']:.2%})")
+    print(f"      Test:  {split_metadata['test_sessions']} sessions ({len(X_test)} windows, pos_rate={split_metadata['positive_rate_test']:.2%})")
+
     pos_count = np.sum(y_train == 1)
     neg_count = np.sum(y_train == 0)
     pos_weight_val = neg_count / max(1, pos_count)
     pos_weight = torch.tensor([pos_weight_val], dtype=torch.float32)
-    print(f"      IDH Class distribution in Train: Positive={pos_count}, Negative={neg_count} (Weight={pos_weight_val:.2f})")
+    print(f"      IDH Class distribution in Train: Pos={pos_count}, Neg={neg_count} (Loss Weight={pos_weight_val:.2f})")
 
     # Save scaler parameters
     scaler_path = os.path.join(artifacts_dir, 'scaler_params.json')
@@ -143,8 +146,9 @@ def train_idh_lstm(
     best_val_f1 = -1.0
     best_state_dict = None
     best_epoch = 0
+    training_history: List[Dict[str, Any]] = []
 
-    print(f"[2/4] Training LSTM network ({epochs} epochs)...")
+    print(f"[2/4] Training LSTM network ({epochs} epochs with real per-epoch history tracking)...")
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0.0
@@ -157,35 +161,46 @@ def train_idh_lstm(
             optimizer.step()
             epoch_loss += loss.item() * batch_x.size(0)
 
-        # Validate each epoch
-        val_metrics = evaluate_dataset(model, eval_criterion, X_val, y_val, batch_size=batch_size)
+        # Real validation and train metrics evaluation for each epoch
+        train_eval = evaluate_dataset(model, eval_criterion, X_train, y_train, batch_size=batch_size)
+        val_eval = evaluate_dataset(model, eval_criterion, X_val, y_val, batch_size=batch_size)
 
-        if val_metrics['f1_score'] > best_val_f1:
-            best_val_f1 = val_metrics['f1_score']
+        training_history.append({
+            'epoch': epoch,
+            'train_loss': train_eval['loss'],
+            'val_loss': val_eval['loss'],
+            'train_accuracy': train_eval['accuracy'],
+            'val_accuracy': val_eval['accuracy'],
+            'train_f1': train_eval['f1_score'],
+            'val_f1': val_eval['f1_score'],
+        })
+
+        if val_eval['f1_score'] > best_val_f1:
+            best_val_f1 = val_eval['f1_score']
             best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             best_epoch = epoch
 
         if epoch % 5 == 0 or epoch == epochs:
-            print(f"      Epoch {epoch:02d}/{epochs:02d} - Loss: {epoch_loss/len(X_train):.4f} - Val F1: {val_metrics['f1_score']:.4f} - Val Acc: {val_metrics['accuracy']:.4f}")
+            print(f"      Epoch {epoch:02d}/{epochs:02d} - Train Loss: {train_eval['loss']:.4f} | Val Loss: {val_eval['loss']:.4f} | Val F1: {val_eval['f1_score']:.4f} | Val Acc: {val_eval['accuracy']:.4f}")
 
     # Load best model weights
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
 
     print(f"[3/4] Evaluating best model (from Epoch {best_epoch})...")
-    train_metrics = evaluate_dataset(model, eval_criterion, X_train, y_train, batch_size=batch_size)
-    val_metrics = evaluate_dataset(model, eval_criterion, X_val, y_val, batch_size=batch_size)
-    test_metrics = evaluate_dataset(model, eval_criterion, X_test, y_test, batch_size=batch_size)
+    final_train_metrics = evaluate_dataset(model, eval_criterion, X_train, y_train, batch_size=batch_size)
+    final_val_metrics = evaluate_dataset(model, eval_criterion, X_val, y_val, batch_size=batch_size)
+    final_test_metrics = evaluate_dataset(model, eval_criterion, X_test, y_test, batch_size=batch_size)
 
-    print(f"      TEST RESULTS:")
-    print(f"      - Accuracy:  {test_metrics['accuracy']:.4f}")
-    print(f"      - Precision: {test_metrics['precision']:.4f}")
-    print(f"      - Recall:    {test_metrics['recall']:.4f}")
-    print(f"      - F1-Score:  {test_metrics['f1_score']:.4f}")
-    print(f"      - Loss:      {test_metrics['loss']:.4f}")
-    print(f"      - ROC-AUC:   {test_metrics['roc_auc']:.4f}")
+    print(f"      TEST SET BENCHMARKS (180 Unseen Sessions, Zero Leakage):")
+    print(f"      - Accuracy:  {final_test_metrics['accuracy']:.4f}")
+    print(f"      - Precision: {final_test_metrics['precision']:.4f}")
+    print(f"      - Recall:    {final_test_metrics['recall']:.4f}")
+    print(f"      - F1-Score:  {final_test_metrics['f1_score']:.4f}")
+    print(f"      - Loss:      {final_test_metrics['loss']:.4f}")
+    print(f"      - ROC-AUC:   {final_test_metrics['roc_auc']:.4f}")
 
-    # [4/4] Save model artifacts
+    # Save model weights
     model_path = os.path.join(artifacts_dir, 'lstm_idh_model.pt')
     torch.save({
         'state_dict': model.state_dict(),
@@ -195,6 +210,7 @@ def train_idh_lstm(
         'best_epoch': best_epoch,
     }, model_path)
 
+    # Save comprehensive evaluation report with real training history
     metrics_path = os.path.join(artifacts_dir, 'evaluation_metrics.json')
     evaluation_report = {
         'model_name': 'IDHLSTMNet',
@@ -202,11 +218,14 @@ def train_idh_lstm(
         'architecture': '2-Layer Stacked LSTM with LayerNorm and Dropout',
         'input_features': scaler_dict['feature_names'],
         'sequence_length': int(X_train.shape[1]),
+        'split_strategy': split_metadata['split_strategy'],
+        'dataset_splits': split_metadata,
         'metrics': {
-            'train': train_metrics,
-            'validation': val_metrics,
-            'test': test_metrics,
+            'train': final_train_metrics,
+            'validation': final_val_metrics,
+            'test': final_test_metrics,
         },
+        'training_history': training_history,
         'training_hyperparameters': {
             'epochs': epochs,
             'best_epoch': best_epoch,

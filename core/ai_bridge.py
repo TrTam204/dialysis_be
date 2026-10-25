@@ -1,7 +1,7 @@
 """
 AI Bridge Service: Bridges Django Core Models with FastAPI LSTM IDH Prediction Service.
-Handles vital signs sequence aggregation, left-padding for short sequences,
-FastAPI REST communication with resilient automatic local engine fallback.
+Handles clinical 8-feature vital signs sequence aggregation, midpoint interpolation for 2-point sequences,
+and FastAPI REST communication with resilient automatic local PyTorch engine fallback.
 """
 from typing import Any, Dict, List
 import json
@@ -31,8 +31,11 @@ def get_local_pipeline() -> IDHInferencePipeline:
 
 def build_vitals_sequence(session: DialysisSession, vitals_qs=None) -> Dict[str, Any]:
     """
-    Construct chronological time-series sequence from session vital signs.
-    Applies left-padding if 1 <= count < 3 so that sequence length >= 3.
+    Construct chronological 8-dimensional time-series sequence from session vital signs.
+    Requires at least 2 recorded vital signs (recorded_count >= 2) to capture temporal delta.
+    - If recorded_count < 2: returns INSUFFICIENT_DATA.
+    - If recorded_count == 2: creates smooth 3-step sequence using linear midpoint interpolation.
+    - If recorded_count >= 3: uses actual recorded chronological steps.
     """
     if vitals_qs is None:
         vitals_qs = session.vital_signs.all().order_by('recorded_at')
@@ -40,18 +43,24 @@ def build_vitals_sequence(session: DialysisSession, vitals_qs=None) -> Dict[str,
     vitals = list(vitals_qs)
     recorded_count = len(vitals)
 
-    if recorded_count == 0:
+    if recorded_count < 2:
         return {
             'has_prediction': False,
             'status': 'INSUFFICIENT_DATA',
-            'message': 'Cần ít nhất 1 lần đo sinh hiệu trong phiên lọc để phân tích dự báo nguy cơ tụt huyết áp (IDH).',
+            'message': 'Cần tối thiểu 2 lần đo sinh hiệu trong phiên lọc để phân tích động học biến thiên huyết áp và dự báo sớm IDH.',
             'vitals_sequence': [],
-            'is_padded': False,
-            'recorded_count': 0,
+            'is_interpolated': False,
+            'recorded_count': recorded_count,
         }
 
     # Reference start time
     base_time = vitals[0].recorded_at or session.actual_start or session.scheduled_start
+
+    # Resolve dry weight (kg)
+    patient = getattr(session, 'patient', None)
+    dry_w = float(patient.dry_weight) if patient and patient.dry_weight and patient.dry_weight > 0 else float(session.pre_weight or 60.0)
+    if dry_w <= 0:
+        dry_w = 60.0
 
     # Estimated UF target and hourly UF rate
     session_uf = float(session.uf_target or session.uf_actual or 2.4)
@@ -60,14 +69,18 @@ def build_vitals_sequence(session: DialysisSession, vitals_qs=None) -> Dict[str,
         diff_hours = (session.scheduled_end - session.scheduled_start).total_seconds() / 3600.0
         if diff_hours > 0.5:
             duration_hours = diff_hours
-    hourly_ufr = round(session_uf / duration_hours, 2)
+    hourly_ufr = round(session_uf / duration_hours, 2)  # L/hour
+    ufr_ml_kg_h = round((hourly_ufr * 1000.0) / dry_w, 2)  # mL/kg/h
+
+    base_sbp = float(vitals[0].systolic_bp if vitals[0].systolic_bp is not None else 120.0)
 
     raw_steps = []
     for idx, vs in enumerate(vitals):
-        sbp = float(vs.systolic_bp) if vs.systolic_bp is not None else 120.0
-        dbp = float(vs.diastolic_bp) if vs.diastolic_bp is not None else 75.0
-        hr = float(vs.heart_rate) if vs.heart_rate is not None else 78.0
+        sbp = float(vs.systolic_bp if vs.systolic_bp is not None else 120.0)
+        dbp = float(vs.diastolic_bp if vs.diastolic_bp is not None else 75.0)
+        hr = float(vs.heart_rate if vs.heart_rate is not None else 78.0)
         map_val = round(dbp + (sbp - dbp) / 3.0, 2)
+        sbp_drop = round(base_sbp - sbp, 2)
 
         if vs.recorded_at and base_time:
             t_min = int(max(0, (vs.recorded_at - base_time).total_seconds() / 60.0))
@@ -75,46 +88,60 @@ def build_vitals_sequence(session: DialysisSession, vitals_qs=None) -> Dict[str,
             t_min = idx * 30
 
         cum_uf = round(min(session_uf, hourly_ufr * (t_min / 60.0)), 2)
+        cum_uf_pct = round((cum_uf / dry_w) * 100.0, 2)
 
         raw_steps.append({
             'systolic_bp': sbp,
             'diastolic_bp': dbp,
             'map': map_val,
+            'sbp_drop_from_baseline': sbp_drop,
             'heart_rate': hr,
             'uf_rate': hourly_ufr,
+            'ufr_ml_kg_h': ufr_ml_kg_h,
             'cumulative_uf': cum_uf,
+            'cumulative_uf_pct': cum_uf_pct,
             'time_elapsed_min': t_min,
+            'dry_weight': dry_w,
         })
 
-    # Left-Padding for short sequences (FastAPI expects at least 3 steps)
-    is_padded = False
-    padded_steps = list(raw_steps)
-
-    if recorded_count == 1:
-        is_padded = True
-        # Replicate first step twice at t=0
-        step0 = dict(raw_steps[0])
-        padded_steps = [dict(step0), dict(step0), raw_steps[0]]
-    elif recorded_count == 2:
-        is_padded = True
-        # Replicate first step once
-        step0 = dict(raw_steps[0])
-        padded_steps = [dict(step0), raw_steps[0], raw_steps[1]]
+    is_interpolated = False
+    if recorded_count == 2:
+        is_interpolated = True
+        # Linear midpoint interpolation between step 0 and step 1
+        s0, s1 = raw_steps[0], raw_steps[1]
+        mid_step = {
+            'systolic_bp': round((s0['systolic_bp'] + s1['systolic_bp']) / 2.0, 2),
+            'diastolic_bp': round((s0['diastolic_bp'] + s1['diastolic_bp']) / 2.0, 2),
+            'map': round((s0['map'] + s1['map']) / 2.0, 2),
+            'sbp_drop_from_baseline': round((s0['sbp_drop_from_baseline'] + s1['sbp_drop_from_baseline']) / 2.0, 2),
+            'heart_rate': round((s0['heart_rate'] + s1['heart_rate']) / 2.0, 2),
+            'uf_rate': s1['uf_rate'],
+            'ufr_ml_kg_h': s1['ufr_ml_kg_h'],
+            'cumulative_uf': round((s0['cumulative_uf'] + s1['cumulative_uf']) / 2.0, 2),
+            'cumulative_uf_pct': round((s0['cumulative_uf_pct'] + s1['cumulative_uf_pct']) / 2.0, 2),
+            'time_elapsed_min': int((s0['time_elapsed_min'] + s1['time_elapsed_min']) / 2),
+            'dry_weight': dry_w,
+        }
+        sequence_steps = [s0, mid_step, s1]
+    else:
+        sequence_steps = list(raw_steps)
 
     # Ensure non-decreasing time_elapsed_min
-    for i in range(1, len(padded_steps)):
-        padded_steps[i]['time_elapsed_min'] = max(
-            padded_steps[i]['time_elapsed_min'],
-            padded_steps[i - 1]['time_elapsed_min'],
+    for i in range(1, len(sequence_steps)):
+        sequence_steps[i]['time_elapsed_min'] = max(
+            sequence_steps[i]['time_elapsed_min'],
+            sequence_steps[i - 1]['time_elapsed_min'],
         )
 
     return {
         'has_prediction': True,
         'status': 'READY',
         'message': 'Đủ dữ liệu sinh hiệu để phân tích dự báo.',
-        'vitals_sequence': padded_steps,
-        'is_padded': is_padded,
+        'vitals_sequence': sequence_steps,
+        'is_interpolated': is_interpolated,
+        'is_padded': is_interpolated,  # Backward compatibility flag
         'recorded_count': recorded_count,
+        'dry_weight': dry_w,
     }
 
 
@@ -134,9 +161,11 @@ def predict_idh_for_session(session: DialysisSession) -> Dict[str, Any]:
         )
         return seq_data
 
+    dry_w = seq_data.get('dry_weight', 60.0)
     payload = {
         'patient_id': session.patient.patient_id if session.patient else None,
         'session_id': session.session_id,
+        'dry_weight': dry_w,
         'threshold': 0.50,
         'vitals_sequence': seq_data['vitals_sequence'],
     }
@@ -153,8 +182,10 @@ def predict_idh_for_session(session: DialysisSession) -> Dict[str, Any]:
                 result['has_prediction'] = True
                 result['status'] = 'READY'
                 result['inference_source'] = 'FASTAPI_MICROSERVICE'
-                result['is_padded'] = seq_data['is_padded']
+                result['is_interpolated'] = seq_data.get('is_interpolated', False)
+                result['is_padded'] = seq_data.get('is_padded', False)
                 result['recorded_vitals_count'] = seq_data['recorded_count']
+                result['dry_weight'] = dry_w
                 result['model_version'] = '1.0.0'
                 result['predicted_at'] = timezone.now().isoformat()
                 result['disclaimer'] = (
@@ -167,7 +198,11 @@ def predict_idh_for_session(session: DialysisSession) -> Dict[str, Any]:
 
     # Attempt 2: Fallback to in-process PyTorch LSTM inference pipeline
     pipeline = get_local_pipeline()
-    prediction = pipeline.predict_sequence(seq_data['vitals_sequence'], threshold=0.50)
+    prediction = pipeline.predict_sequence(
+        seq_data['vitals_sequence'],
+        threshold=0.50,
+        dry_weight=dry_w,
+    )
 
     return {
         'has_prediction': True,
@@ -183,8 +218,10 @@ def predict_idh_for_session(session: DialysisSession) -> Dict[str, Any]:
         'clinical_recommendations': prediction['clinical_recommendations'],
         'sequence_length_received': prediction['sequence_length_received'],
         'inference_source': 'LOCAL_LSTM_ENGINE',
-        'is_padded': seq_data['is_padded'],
+        'is_interpolated': seq_data.get('is_interpolated', False),
+        'is_padded': seq_data.get('is_padded', False),
         'recorded_vitals_count': seq_data['recorded_count'],
+        'dry_weight': dry_w,
         'model_version': '1.0.0',
         'predicted_at': timezone.now().isoformat(),
         'disclaimer': (
@@ -196,8 +233,9 @@ def predict_idh_for_session(session: DialysisSession) -> Dict[str, Any]:
 
 def get_lstm_model_info() -> Dict[str, Any]:
     """
-    Retrieve model evaluation metrics and training history.
+    Retrieve model evaluation metrics and real training history.
     Tries FastAPI GET /model-info, falls back to artifacts/evaluation_metrics.json.
+    NO synthetic curve generation — reads 100% genuine training logs.
     """
     service_url = getattr(settings, 'FASTAPI_IDH_SERVICE_URL', 'http://127.0.0.1:8001')
     endpoint = f"{service_url.rstrip('/')}/model-info"
@@ -206,9 +244,7 @@ def get_lstm_model_info() -> Dict[str, Any]:
         with httpx.Client(timeout=2.0) as client:
             resp = client.get(endpoint)
             if resp.status_code == 200:
-                data = resp.json()
-                _enrich_training_curves(data)
-                return data
+                return resp.json()
     except Exception:
         pass
 
@@ -218,42 +254,10 @@ def get_lstm_model_info() -> Dict[str, Any]:
 
     if os.path.exists(metrics_path):
         with open(metrics_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            _enrich_training_curves(data)
-            return data
+            return json.load(f)
 
     return {
         'model_name': 'IDHLSTMNet',
         'status': 'NO_ARTIFACTS_FOUND',
         'metrics': {},
     }
-
-
-def _enrich_training_curves(report: Dict[str, Any]) -> None:
-    """Enrich report with synthetic epoch-by-epoch loss & accuracy curves for Chart.js rendering."""
-    if 'training_history' in report:
-        return
-
-    epochs = 30
-    history = []
-    # Smooth loss decay and accuracy increase based on logged training milestones
-    for ep in range(1, epochs + 1):
-        ratio = ep / epochs
-        train_loss = round(0.48 * (1 - ratio * 0.93) + 0.033, 4)
-        val_loss = round(0.44 * (1 - ratio * 0.91) + 0.039, 4)
-        train_acc = round(min(0.989, 0.82 + 0.169 * (ratio ** 0.5)), 4)
-        val_acc = round(min(0.991, 0.80 + 0.191 * (ratio ** 0.5)), 4)
-        train_f1 = round(min(0.962, 0.75 + 0.212 * (ratio ** 0.5)), 4)
-        val_f1 = round(min(0.969, 0.74 + 0.229 * (ratio ** 0.5)), 4)
-
-        history.append({
-            'epoch': ep,
-            'train_loss': train_loss,
-            'val_loss': val_loss,
-            'train_accuracy': train_acc,
-            'val_accuracy': val_acc,
-            'train_f1': train_f1,
-            'val_f1': val_f1,
-        })
-
-    report['training_history'] = history

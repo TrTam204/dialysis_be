@@ -18,20 +18,19 @@ class TestIDHAIService(unittest.TestCase):
         cls.pipeline = IDHInferencePipeline()
 
     def test_01_dataset_generator_shape_and_labels(self):
-        """Verify data generator outputs correct 3D sequence and binary label tensors."""
-        sequences, labels = generate_hemodialysis_sessions(n_sessions=20, seed=42)
-        # Sliced windows: 20 sessions * (9 - 5) = 80 samples
+        """Verify data generator outputs correct 3D sequence (seq_len=3, n_features=8) and binary label tensors."""
+        sequences, labels = generate_hemodialysis_sessions(n_sessions=20, seed=42, seq_len=3)
         self.assertEqual(len(sequences.shape), 3)
-        self.assertEqual(sequences.shape[1], 5)  # seq_len = 5
-        self.assertEqual(sequences.shape[2], 7)  # n_features = 7
+        self.assertEqual(sequences.shape[1], 3)  # seq_len = 3
+        self.assertEqual(sequences.shape[2], 8)  # n_features = 8
         self.assertEqual(len(labels), len(sequences))
         self.assertTrue(set(labels).issubset({0.0, 1.0}))
 
     def test_02_lstm_model_architecture_forward(self):
-        """Verify forward pass of PyTorch LSTM neural network."""
-        model = IDHLSTMNet(input_dim=7, hidden_dim=32, num_layers=2)
+        """Verify forward pass of PyTorch LSTM neural network with 8 input features."""
+        model = IDHLSTMNet(input_dim=8, hidden_dim=32, num_layers=2)
         model.eval()
-        dummy_input = torch.randn(4, 5, 7)
+        dummy_input = torch.randn(4, 3, 8)
         with torch.no_grad():
             output = model(dummy_input)
         self.assertEqual(output.shape, (4, 1))
@@ -41,6 +40,7 @@ class TestIDHAIService(unittest.TestCase):
         self.assertTrue(self.pipeline.is_loaded)
         self.assertIsNotNone(self.pipeline.model)
         self.assertIsNotNone(self.pipeline.scaler_mean)
+        self.assertEqual(len(self.pipeline.feature_names), 8)
 
     def test_04_fastapi_health_endpoint(self):
         """Verify GET /health returns status HEALTHY and model_loaded True."""
@@ -52,7 +52,7 @@ class TestIDHAIService(unittest.TestCase):
         self.assertEqual(data["device"], "cpu")
 
     def test_05_fastapi_model_info_endpoint(self):
-        """Verify GET /model-info returns required evaluation metrics."""
+        """Verify GET /model-info returns required evaluation metrics and genuine training history."""
         response = self.client.get("/model-info")
         self.assertEqual(response.status_code, 200)
         data = response.json()
@@ -70,18 +70,21 @@ class TestIDHAIService(unittest.TestCase):
         self.assertGreater(test_metrics["accuracy"], 0.90)
         self.assertGreater(test_metrics["f1_score"], 0.85)
 
+        # Check that real training_history exists
+        self.assertIn("training_history", data)
+        self.assertGreater(len(data["training_history"]), 0)
+
     def test_06_fastapi_predict_idh_stable_trajectory(self):
         """Verify POST /predict-idh on stable vital signs trajectory yields LOW risk."""
         payload = {
             "patient_id": "PT-TEST-STABLE",
             "session_id": "SS-TEST-001",
+            "dry_weight": 60.0,
             "threshold": 0.50,
             "vitals_sequence": [
                 {"systolic_bp": 135.0, "diastolic_bp": 80.0, "heart_rate": 72.0, "uf_rate": 0.6, "cumulative_uf": 0.3, "time_elapsed_min": 0},
                 {"systolic_bp": 132.0, "diastolic_bp": 78.0, "heart_rate": 74.0, "uf_rate": 0.6, "cumulative_uf": 0.6, "time_elapsed_min": 30},
                 {"systolic_bp": 130.0, "diastolic_bp": 77.0, "heart_rate": 73.0, "uf_rate": 0.6, "cumulative_uf": 0.9, "time_elapsed_min": 60},
-                {"systolic_bp": 128.0, "diastolic_bp": 76.0, "heart_rate": 75.0, "uf_rate": 0.6, "cumulative_uf": 1.2, "time_elapsed_min": 90},
-                {"systolic_bp": 126.0, "diastolic_bp": 75.0, "heart_rate": 74.0, "uf_rate": 0.6, "cumulative_uf": 1.5, "time_elapsed_min": 120},
             ],
         }
         response = self.client.post("/predict-idh", json=payload)
@@ -98,13 +101,12 @@ class TestIDHAIService(unittest.TestCase):
         payload = {
             "patient_id": "PT-TEST-ALERT",
             "session_id": "SS-TEST-002",
+            "dry_weight": 48.0,
             "threshold": 0.50,
             "vitals_sequence": [
-                {"systolic_bp": 130.0, "diastolic_bp": 80.0, "heart_rate": 70.0, "uf_rate": 1.2, "cumulative_uf": 0.6, "time_elapsed_min": 0},
-                {"systolic_bp": 120.0, "diastolic_bp": 72.0, "heart_rate": 74.0, "uf_rate": 1.3, "cumulative_uf": 1.2, "time_elapsed_min": 30},
-                {"systolic_bp": 105.0, "diastolic_bp": 65.0, "heart_rate": 84.0, "uf_rate": 1.4, "cumulative_uf": 1.9, "time_elapsed_min": 60},
-                {"systolic_bp": 92.0, "diastolic_bp": 58.0, "heart_rate": 92.0, "uf_rate": 1.4, "cumulative_uf": 2.6, "time_elapsed_min": 90},
-                {"systolic_bp": 82.0, "diastolic_bp": 50.0, "heart_rate": 96.0, "uf_rate": 1.4, "cumulative_uf": 3.3, "time_elapsed_min": 120},
+                {"systolic_bp": 132.0, "diastolic_bp": 80.0, "heart_rate": 74.0, "uf_rate": 0.9, "cumulative_uf": 0.5, "time_elapsed_min": 0},
+                {"systolic_bp": 118.0, "diastolic_bp": 72.0, "heart_rate": 84.0, "uf_rate": 0.9, "cumulative_uf": 1.0, "time_elapsed_min": 30},
+                {"systolic_bp": 94.0, "diastolic_bp": 60.0, "heart_rate": 96.0, "uf_rate": 0.9, "cumulative_uf": 1.5, "time_elapsed_min": 60},
             ],
         }
         response = self.client.post("/predict-idh", json=payload)

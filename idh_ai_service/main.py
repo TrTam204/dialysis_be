@@ -137,6 +137,7 @@ async def predict_idh(request: PredictIDHRequest):
         prediction_result = pipe.predict_sequence(
             vitals_list=vitals_dicts,
             threshold=request.threshold or 0.50,
+            dry_weight=request.dry_weight,
         )
     except Exception as exc:
         raise HTTPException(
