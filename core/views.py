@@ -530,9 +530,10 @@ class KMeansReportView(APIView):
     """
     Unsupervised Machine Learning: Pure Python K-Means patient clustering report.
     Clusters hemodialysis patients based on 4 clinical/biochemical features:
-    age, avg_hemoglobin, avg_potassium, and avg_uf.
+    age, avg_hemoglobin, avg_potassium, and avg_idwg_pct.
+    Accessible only by ADMIN and DOCTOR.
     """
-    permission_classes = [permissions.IsAuthenticated, IsStaffMember]
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrDoctor]
 
     def get(self, request):
         k_param = request.query_params.get('k', 3)

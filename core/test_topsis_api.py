@@ -240,3 +240,12 @@ class TopsisApiTests(TestCase):
         self.assertEqual(patients_before, patients_after, "Patient table was modified during TOPSIS ranking!")
         self.assertEqual(DialysisSession.objects.count(), sessions_count_before)
         self.assertEqual(SchedulePlan.objects.count(), plans_count_before)
+
+    def test_10_nurse_access_forbidden(self):
+        """Nurse is forbidden from accessing TOPSIS criteria and ranking (403)."""
+        self.client.force_authenticate(user=self.nurse_a)
+        res_crit = self.client.get(reverse("topsis-criteria"))
+        self.assertEqual(res_crit.status_code, status.HTTP_403_FORBIDDEN)
+
+        res_rank = self.client.post(reverse("topsis-rank"), {"department": self.dept_a.id}, format="json")
+        self.assertEqual(res_rank.status_code, status.HTTP_403_FORBIDDEN)

@@ -8,7 +8,7 @@ from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from core.permissions import IsStaffMember
+from core.permissions import IsAdminOrDoctor
 from core.topsis_service import TopsisTriageService
 
 
@@ -16,8 +16,9 @@ class TopsisCriteriaView(APIView):
     """
     GET /api/topsis/criteria/
     Returns the TOPSIS criteria catalogue, default weights, and clinical disclaimers.
+    Accessible only by ADMIN and DOCTOR.
     """
-    permission_classes = [permissions.IsAuthenticated, IsStaffMember]
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrDoctor]
 
     def get(self, request):
         catalogue = TopsisTriageService.get_criteria_catalogue()
@@ -40,8 +41,9 @@ class TopsisRankView(APIView):
     POST /api/topsis/rank/
     Executes TOPSIS multi-criteria priority ranking for patients in a department.
     Ensures zero cross-department data leakage and preserves read-only safety.
+    Accessible only by ADMIN and DOCTOR.
     """
-    permission_classes = [permissions.IsAuthenticated, IsStaffMember]
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrDoctor]
 
     def post(self, request):
         data = request.data or {}
