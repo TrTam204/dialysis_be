@@ -1,4 +1,23 @@
 import json
+import math
+
+CENTER_LAT = 10.7556
+CENTER_LON = 106.6602
+CENTER_NAME = "Bệnh viện Chợ Rẫy TP.HCM"
+CENTER_ADDRESS = "201B Nguyễn Chí Thanh, Phường 12, Quận 5, TP.HCM"
+
+
+def calculate_haversine_km(lat1, lon1, lat2, lon2):
+    r = 6371.0
+    d_lat = math.radians(lat2 - lat1)
+    d_lon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(d_lat / 2) ** 2
+        + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lon / 2) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return round(r * c, 2)
+
 
 from rest_framework import serializers
 
@@ -13,6 +32,7 @@ from .models import (
     ScheduleAssignment,
     SchedulePlan,
     VitalSign,
+    MedicalMessage,
 )
 from .services import (
     validate_blood_sample_data,
@@ -38,7 +58,7 @@ class DepartmentSerializer(serializers.ModelSerializer):
 
 
 class CustomUserSerializer(serializers.ModelSerializer):
-    department = serializers.PrimaryKeyRelatedField(queryset=Department.objects.all())
+    department = serializers.PrimaryKeyRelatedField(queryset=Department.objects.all(), required=False, allow_null=True)
     department_name = serializers.CharField(source='department.name', read_only=True)
     password = serializers.CharField(write_only=True, required=False, trim_whitespace=False)
 
@@ -91,6 +111,13 @@ class PatientSerializer(serializers.ModelSerializer):
     )
     department_name = serializers.CharField(source='department.name', read_only=True, default=None)
     location = serializers.SerializerMethodField()
+    latitude = serializers.FloatField(required=False, allow_null=True)
+    longitude = serializers.FloatField(required=False, allow_null=True)
+    distance_km = serializers.FloatField(read_only=True, required=False, allow_null=True)
+    center_name = serializers.CharField(read_only=True, required=False)
+    center_address = serializers.CharField(read_only=True, required=False)
+    center_lat = serializers.FloatField(read_only=True, required=False)
+    center_lon = serializers.FloatField(read_only=True, required=False)
 
     class Meta:
         model = Patient
@@ -103,6 +130,13 @@ class PatientSerializer(serializers.ModelSerializer):
             'medical_history',
             'dry_weight',
             'location',
+            'latitude',
+            'longitude',
+            'distance_km',
+            'center_name',
+            'center_address',
+            'center_lat',
+            'center_lon',
             'status',
             'department',
             'department_name',
@@ -114,12 +148,35 @@ class PatientSerializer(serializers.ModelSerializer):
         read_only_fields = ['created_at', 'updated_at']
 
     def get_location(self, obj):
-        # Phase 1: expose the PostGIS point as GeoJSON, read-only.
         if obj.location is None:
             return None
         return json.loads(obj.location.json)
 
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret['center_name'] = CENTER_NAME
+        ret['center_address'] = CENTER_ADDRESS
+        ret['center_lat'] = CENTER_LAT
+        ret['center_lon'] = CENTER_LON
+        if instance.location:
+            ret['latitude'] = round(instance.location.y, 6)
+            ret['longitude'] = round(instance.location.x, 6)
+            ret['distance_km'] = calculate_haversine_km(instance.location.y, instance.location.x, CENTER_LAT, CENTER_LON)
+        else:
+            ret['latitude'] = None
+            ret['longitude'] = None
+            ret['distance_km'] = None
+        return ret
+
     def validate(self, attrs):
+        lat = attrs.get('latitude')
+        lng = attrs.get('longitude')
+        if lat is not None and not (-90.0 <= lat <= 90.0):
+            raise serializers.ValidationError({'latitude': ['Vĩ độ phải nằm trong khoảng [-90.0, 90.0].']})
+        if lng is not None and not (-180.0 <= lng <= 180.0):
+            raise serializers.ValidationError({'longitude': ['Kinh độ phải nằm trong khoảng [-180.0, 180.0].']})
+        if (lat is not None and lng is None) or (lat is None and lng is not None):
+            raise serializers.ValidationError({'location': ['Cần cung cấp đồng thời cả vĩ độ (latitude) và kinh độ (longitude).']})
         validate_patient_data(attrs, self.instance)
 
         request = self.context.get('request')
@@ -176,6 +233,27 @@ class PatientSerializer(serializers.ModelSerializer):
                         })
 
         return attrs
+
+    def create(self, validated_data):
+        lat = validated_data.pop('latitude', None)
+        lng = validated_data.pop('longitude', None)
+        if lat is not None and lng is not None:
+            from django.contrib.gis.geos import Point
+            validated_data['location'] = Point(float(lng), float(lat), srid=4326)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        has_lat = 'latitude' in validated_data
+        has_lng = 'longitude' in validated_data
+        lat = validated_data.pop('latitude', None)
+        lng = validated_data.pop('longitude', None)
+        if has_lat and has_lng:
+            if lat is not None and lng is not None:
+                from django.contrib.gis.geos import Point
+                instance.location = Point(float(lng), float(lat), srid=4326)
+            else:
+                instance.location = None
+        return super().update(instance, validated_data)
 
 
 class DialysisMachineSerializer(serializers.ModelSerializer):
@@ -242,6 +320,8 @@ class DialysisSessionSerializer(serializers.ModelSerializer):
             'during_dialysis_bp',
             'post_dialysis_bp',
             'status',
+            'is_emergency',
+            'emergency_details',
             'notes',
             'created_at',
             'updated_at',
@@ -336,7 +416,11 @@ class VitalSignSerializer(serializers.ModelSerializer):
 
 class AuditLogSerializer(serializers.ModelSerializer):
     actor_name = serializers.SerializerMethodField()
+    actor_username = serializers.CharField(source='actor.username', read_only=True, default=None)
     actor_role = serializers.CharField(source='actor.role', read_only=True, default=None)
+    user_full_name = serializers.SerializerMethodField()
+    username = serializers.CharField(source='actor.username', read_only=True, default=None)
+    user_role = serializers.CharField(source='actor.role', read_only=True, default=None)
 
     class Meta:
         model = AuditLog
@@ -344,7 +428,11 @@ class AuditLogSerializer(serializers.ModelSerializer):
             'id',
             'actor',
             'actor_name',
+            'actor_username',
             'actor_role',
+            'user_full_name',
+            'username',
+            'user_role',
             'action',
             'entity_type',
             'entity_id',
@@ -354,6 +442,9 @@ class AuditLogSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def get_actor_name(self, obj):
+        return _user_display(obj.actor)
+
+    def get_user_full_name(self, obj):
         return _user_display(obj.actor)
 
 
@@ -463,3 +554,88 @@ class ScheduleAssignmentSerializer(serializers.ModelSerializer):
                 attrs['original_shift'] = attrs.get('shift')
 
         return attrs
+
+
+class MedicalMessageSerializer(serializers.ModelSerializer):
+    sender = serializers.PrimaryKeyRelatedField(read_only=True)
+    sender_name = serializers.SerializerMethodField()
+    sender_role = serializers.CharField(source='sender.role', read_only=True)
+    receiver_name = serializers.SerializerMethodField()
+    recipient = serializers.PrimaryKeyRelatedField(source='receiver', queryset=CustomUser.objects.all(), required=False, allow_null=True)
+    recipient_name = serializers.SerializerMethodField()
+    department_name = serializers.CharField(source='department.name', read_only=True)
+    session_code = serializers.CharField(source='session_reference.session_id', read_only=True)
+    content = serializers.CharField(required=False, allow_blank=True, default='')
+    attachment_file = serializers.FileField(required=False, allow_null=True)
+    attachment_type = serializers.CharField(max_length=20, required=False, allow_blank=True, allow_null=True)
+    attachment_name = serializers.CharField(max_length=255, required=False, allow_blank=True, allow_null=True)
+    attachment_url = serializers.SerializerMethodField()
+    metadata = serializers.JSONField(required=False, default=dict)
+    read_by_users = serializers.JSONField(read_only=True)
+
+    class Meta:
+        model = MedicalMessage
+        fields = [
+            'id',
+            'sender',
+            'sender_name',
+            'sender_role',
+            'receiver',
+            'receiver_name',
+            'recipient',
+            'recipient_name',
+            'department',
+            'department_name',
+            'content',
+            'session_reference',
+            'session_code',
+            'is_read',
+            'read_by_users',
+            'attachment_file',
+            'attachment_type',
+            'attachment_name',
+            'attachment_url',
+            'metadata',
+            'created_at',
+        ]
+        read_only_fields = ['id', 'sender', 'department', 'created_at', 'read_by_users', 'attachment_url']
+
+    def to_internal_value(self, data):
+        if hasattr(data, 'dict'):
+            data = data.dict()
+        else:
+            data = dict(data.items()) if hasattr(data, 'items') else dict(data)
+
+        if 'recipient' in data and 'receiver' not in data:
+            data['receiver'] = data['recipient']
+        elif 'receiver' in data and 'recipient' not in data:
+            data['recipient'] = data['receiver']
+
+        # Parse metadata if it was passed as a JSON string (e.g. from FormData)
+        if 'metadata' in data and isinstance(data['metadata'], str):
+            try:
+                data['metadata'] = json.loads(data['metadata'])
+            except Exception:
+                data['metadata'] = {}
+
+        return super().to_internal_value(data)
+
+    def get_sender_name(self, obj):
+        return f"{obj.sender.last_name} {obj.sender.first_name}".strip() or obj.sender.username
+
+    def get_receiver_name(self, obj):
+        if not obj.receiver:
+            return 'Toàn khoa'
+        return f"{obj.receiver.last_name} {obj.receiver.first_name}".strip() or obj.receiver.username
+
+    def get_recipient_name(self, obj):
+        return self.get_receiver_name(obj)
+
+    def get_attachment_url(self, obj):
+        if obj.attachment_file:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.attachment_file.url)
+            return obj.attachment_file.url
+        return None
+

@@ -24,6 +24,8 @@ from .views import (
     report_operational_summary_view,
     KMeansReportView,
     LSTMModelInfoView,
+    OnlineStatusView,
+    MedicalMessageViewSet,
 )
 from .views_topsis import TopsisCriteriaView, TopsisRankView
 
@@ -38,6 +40,8 @@ router.register(r'vital-signs', VitalSignViewSet, basename='vitalsign')
 router.register(r'audit-logs', AuditLogViewSet, basename='auditlog')
 router.register(r'schedule-plans', SchedulePlanViewSet, basename='scheduleplan')
 router.register(r'schedule-assignments', ScheduleAssignmentViewSet, basename='scheduleassignment')
+router.register(r'chat/messages', MedicalMessageViewSet, basename='chat-messages')
+router.register(r'messages', MedicalMessageViewSet, basename='messages')
 
 urlpatterns = [
     path('dashboard/summary/', dashboard_summary_view, name='dashboard-summary'),
@@ -52,6 +56,7 @@ urlpatterns = [
     path('reports/blood-samples/', BloodSampleReportView.as_view(), name='reports-blood-samples'),
     path('reports/kmeans-clusters/', KMeansReportView.as_view(), name='report-kmeans'),
     path('ai/lstm-model-info/', LSTMModelInfoView.as_view(), name='lstm-model-info'),
+    path('users/online-status/', OnlineStatusView.as_view(), name='users-online-status'),
     path('topsis/criteria/', TopsisCriteriaView.as_view(), name='topsis-criteria'),
     path('topsis/rank/', TopsisRankView.as_view(), name='topsis-rank'),
     path('', include(router.urls)),

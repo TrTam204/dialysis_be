@@ -1,8 +1,10 @@
+from django.utils import timezone as dj_timezone
 from django.db import transaction
 from django.db.models import ProtectedError
 from django.shortcuts import get_object_or_404
 from django_filters import rest_framework as django_filters
 from rest_framework import filters, permissions, status, viewsets
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.views import APIView
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import ValidationError
@@ -20,6 +22,7 @@ from .models import (
     ScheduleAssignment,
     SchedulePlan,
     VitalSign,
+    MedicalMessage,
 )
 from .permissions import (
     IsAdmin,
@@ -40,6 +43,7 @@ from .serializers import (
     ScheduleAssignmentSerializer,
     SchedulePlanSerializer,
     VitalSignSerializer,
+    MedicalMessageSerializer,
 )
 from .kmeans_service import KMeansClusteringService
 from .ai_bridge import predict_idh_for_session, get_lstm_model_info
@@ -119,7 +123,7 @@ class PatientViewSet(BaseRoleAwareViewSet):
     def get_permissions(self):
         if self.action == 'create':
             self.permission_classes = [permissions.IsAuthenticated, IsAdminOrDoctor]
-        elif self.action == 'update':
+        elif self.action in {'update', 'transfer'}:
             self.permission_classes = [permissions.IsAuthenticated, IsAdminOrDoctor]
         elif self.action == 'partial_update':
             # NURSE gets a workflow-limited update: PATCH status only.
@@ -132,6 +136,51 @@ class PatientViewSet(BaseRoleAwareViewSet):
         else:
             self.permission_classes = [permissions.IsAuthenticated, IsStaffMember]
         return super().get_permissions()
+
+    @action(detail=True, methods=['post'], url_path='transfer')
+    def transfer(self, request, pk=None):
+        patient = self.get_object()
+        target_dept_id = request.data.get('target_department_id') or request.data.get('department') or request.data.get('department_id')
+        reason = request.data.get('reason', '')
+
+        if not target_dept_id:
+            return Response({'detail': 'Cần cung cấp target_department_id để chuyển khoa.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            target_dept = Department.objects.get(id=target_dept_id, is_active=True)
+        except Department.DoesNotExist:
+            return Response({'detail': 'Khoa đích không tồn tại hoặc đã bị vô hiệu hóa.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if patient.department_id == target_dept.id:
+            return Response({'detail': f'Bệnh nhân hiện đã thuộc {target_dept.name}.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        old_dept_name = patient.department.name if patient.department else 'Chưa có'
+        old_dept_id = patient.department_id
+
+        with transaction.atomic():
+            patient.department = target_dept
+            patient.save(update_fields=['department', 'updated_at'])
+
+            record_audit_log(
+                actor=request.user,
+                action=AuditLog.Action.UPDATE,
+                instance=patient,
+                changes={
+                    'action': 'TRANSFER_DEPARTMENT',
+                    'from_department_id': old_dept_id,
+                    'to_department_id': target_dept.id,
+                    'from_department_name': old_dept_name,
+                    'to_department_name': target_dept.name,
+                    'reason': reason,
+                },
+            )
+
+        serializer = self.get_serializer(patient)
+        return Response({
+            'success': True,
+            'detail': f'Đã chuyển bệnh nhân {patient.full_name} sang {target_dept.name} thành công.',
+            'patient': serializer.data,
+        }, status=status.HTTP_200_OK)
 
 
 class DialysisMachineViewSet(BaseRoleAwareViewSet):
@@ -230,6 +279,86 @@ class DialysisSessionViewSet(BaseRoleAwareViewSet):
 
         result = predict_idh_for_session(session)
         return Response(result, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='sos')
+    def emergency_sos(self, request, pk=None):
+        session = self.get_object()
+        user = request.user
+        reason = request.data.get('reason', 'Khẩn cấp không xác định')
+        notes = request.data.get('notes', '')
+
+        now = dj_timezone.now()
+        now_local = dj_timezone.localtime(now)
+        sos_info = {
+            'triggered_by': user.username,
+            'triggered_by_name': f"{user.last_name} {user.first_name}".strip() or user.username,
+            'triggered_by_role': user.role,
+            'reason': reason,
+            'notes': notes,
+            'timestamp': now_local.isoformat(),
+        }
+
+        with transaction.atomic():
+            session.is_emergency = True
+            session.emergency_details = sos_info
+            sos_prefix = f"\n[🚨 BÁO ĐỘNG SOS {now_local.strftime('%d/%m/%Y %H:%M:%S')}] {user.username} ({user.role}): {reason}"
+            if notes:
+                sos_prefix += f" - {notes}"
+            session.clinical_notes = (session.clinical_notes or '') + sos_prefix
+            session.save(update_fields=['is_emergency', 'emergency_details', 'clinical_notes', 'updated_at'])
+
+            record_audit_log(
+                actor=user,
+                action=AuditLog.Action.UPDATE,
+                instance=session,
+                changes={'EMERGENCY_SOS': sos_info},
+            )
+
+            # Auto-broadcast emergency alert to department chat
+            try:
+                dept = session.patient.department or user.department
+                if dept:
+                    MedicalMessage.objects.create(
+                        sender=user,
+                        receiver=None,
+                        department=dept,
+                        content=f"🚨 [BÁO ĐỘNG SOS KHẨN CẤP] Ca lọc #{session.session_id} - Bệnh nhân {session.patient.full_name} gặp sự cố cấp tính: {reason}. Đề nghị Bác sĩ và kíp trực hỗ trợ ngay!",
+                        session_reference=session,
+                    )
+            except Exception:
+                pass
+
+        protocol_guidelines = [
+            {'step': 1, 'title': 'Ngừng rút dịch (UF rate = 0)', 'action': 'Lập tức chuyển tốc độ siêu lọc UF rate về 0 mL/h trên máy lọc.'},
+            {'step': 2, 'title': 'Tư thế cấp cứu Trendelenburg', 'action': 'Hạ đầu giường thấp, nâng cao chân bệnh nhân 30-45 độ để duy trì tuần hoàn não.'},
+            {'step': 3, 'title': 'Truyền bù dịch đẳng trương', 'action': 'Mở khóa đường truyền xả nhanh 100 - 200 mL dung dịch NaCl 0.9% qua cổng tĩnh mạch quả lọc.'},
+            {'step': 4, 'title': 'Giảm tốc độ bơm máu Qb', 'action': 'Hạ lưu lượng dòng máu Qb xuống 150 - 200 mL/phút, hạ nhiệt độ dịch lọc xuống 35.5 - 36.0 °C.'},
+            {'step': 5, 'title': 'Báo động Bác sĩ phụ trách kíp trực', 'action': f'Bác sĩ khoa tiếp nhận xử lý cấp cứu tại giường máy {session.machine.name if session.machine else session.session_id} ngay lập tức.'},
+        ]
+
+        return Response({
+            'success': True,
+            'session_id': session.session_id,
+            'is_emergency': True,
+            'emergency_details': sos_info,
+            'protocol_guidelines': protocol_guidelines,
+            'detail': f'Đã kích hoạt báo động khẩn cấp SOS cho phiên lọc {session.session_id}.',
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='clear-sos')
+    def clear_sos(self, request, pk=None):
+        session = self.get_object()
+        user = request.user
+        with transaction.atomic():
+            session.is_emergency = False
+            session.save(update_fields=['is_emergency', 'updated_at'])
+            record_audit_log(
+                actor=user,
+                action=AuditLog.Action.UPDATE,
+                instance=session,
+                changes={'EMERGENCY_SOS_CLEARED': {'cleared_by': user.username, 'timestamp': dj_timezone.now().isoformat()}},
+            )
+        return Response({'success': True, 'is_emergency': False, 'detail': 'Đã hủy trạng thái báo động khẩn cấp SOS.'}, status=status.HTTP_200_OK)
 
 
 class BloodSampleViewSet(BaseRoleAwareViewSet):
@@ -354,7 +483,7 @@ class AuditLogFilter(django_filters.FilterSet):
 
 
 class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = AuditLog.objects.select_related('actor').all().order_by('-timestamp')
+    queryset = AuditLog.objects.select_related('actor').exclude(entity_type__iexact='MedicalMessage').order_by('-timestamp')
     serializer_class = AuditLogSerializer
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
     filter_backends = [
@@ -366,6 +495,9 @@ class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
     search_fields = ['entity_type', 'entity_id', 'actor__username', 'actor__first_name', 'actor__last_name']
     ordering_fields = ['id', 'timestamp', 'entity_type', 'action']
     ordering = ['-timestamp']
+
+    def get_queryset(self):
+        return super().get_queryset().exclude(entity_type__iexact='MedicalMessage')
 
 
 class SchedulePlanViewSet(BaseRoleAwareViewSet):
@@ -631,3 +763,396 @@ class LSTMModelInfoView(APIView):
     def get(self, request):
         info = get_lstm_model_info()
         return Response(info, status=status.HTTP_200_OK)
+
+
+def format_status_text(last_seen, now=None):
+    if not last_seen:
+        return 'Không hoạt động'
+    if now is None:
+        now = dj_timezone.now()
+    diff = (now - last_seen).total_seconds()
+    if diff <= 300:
+        return 'Đang hoạt động'
+    minutes = int(diff // 60)
+    if minutes < 60:
+        return f'Hoạt động {minutes} phút trước'
+    hours = int(minutes // 60)
+    if hours < 24:
+        return f'Hoạt động {hours} giờ trước'
+    days = int(hours // 24)
+    return f'Hoạt động {days} ngày trước'
+
+
+class OnlineStatusView(APIView):
+    """
+    Returns list of online doctors, nurses, and admins across the hospital.
+    """
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember]
+
+    def get(self, request):
+        user = request.user
+        now = dj_timezone.now()
+
+        from django.core.cache import cache
+        cache.set(f'user_online_{user.id}', True, timeout=300)
+        CustomUser.objects.filter(pk=user.pk).update(last_seen=now)
+
+        qs = CustomUser.objects.filter(is_active=True).select_related('department')
+
+        online_staff = []
+        for staff in qs:
+            is_cached = bool(cache.get(f'user_online_{staff.id}'))
+            is_recent = bool(staff.last_seen and (now - staff.last_seen).total_seconds() <= 300)
+            is_online = is_cached or is_recent or (staff.id == user.id)
+
+            full_name = f"{staff.last_name} {staff.first_name}".strip() or staff.username
+            status_text = 'Đang hoạt động' if is_online else format_status_text(staff.last_seen, now=now)
+            dept_name = staff.department.name if staff.department else ('Toàn viện' if staff.role == CustomUser.Role.ADMIN else 'Chưa phân khoa')
+
+            online_staff.append({
+                'id': staff.id,
+                'username': staff.username,
+                'full_name': full_name,
+                'role': staff.role,
+                'department_id': staff.department_id,
+                'department_name': dept_name,
+                'is_online': is_online,
+                'last_seen': staff.last_seen.isoformat() if staff.last_seen else None,
+                'status_text': status_text,
+            })
+
+        online_staff.sort(key=lambda s: (not s['is_online'], s['role'], s['full_name']))
+
+        return Response({
+            'count_online': sum(1 for s in online_staff if s['is_online']),
+            'total_staff': len(online_staff),
+            'staff': online_staff,
+        }, status=status.HTTP_200_OK)
+
+
+class MedicalMessageViewSet(BaseRoleAwareViewSet):
+    queryset = MedicalMessage.objects.select_related('sender', 'receiver', 'department', 'session_reference').all().order_by('created_at')
+    serializer_class = MedicalMessageSerializer
+    permission_classes = [permissions.IsAuthenticated, IsStaffMember]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+    search_fields = ['content', 'sender__username', 'receiver__username']
+
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+        if request.user and request.user.is_authenticated:
+            now = dj_timezone.now()
+            from django.core.cache import cache
+            cache.set(f'user_online_{request.user.id}', True, timeout=300)
+            CustomUser.objects.filter(pk=request.user.pk).update(last_seen=now)
+
+    def get_queryset(self):
+        user = self.request.user
+        if not user or not user.is_authenticated:
+            return MedicalMessage.objects.none()
+
+        channel = self.request.query_params.get('channel')
+        receiver_id = self.request.query_params.get('receiver') or self.request.query_params.get('recipient_id') or self.request.query_params.get('recipient')
+        recipient_isnull = self.request.query_params.get('recipient__isnull') or self.request.query_params.get('receiver__isnull')
+
+        from django.db.models import Q
+        base_qs = MedicalMessage.objects.select_related('sender', 'receiver', 'department', 'session_reference')
+
+        if receiver_id:
+            # 1-1 Direct Messages:
+            # TUYET DOI KHONG loc theo department!
+            try:
+                target_id = int(receiver_id)
+                qs = base_qs.filter(
+                    (Q(sender=user, receiver_id=target_id)) |
+                    (Q(sender_id=target_id, receiver=user))
+                )
+                # Auto mark unread incoming messages as read
+                MedicalMessage.objects.filter(sender_id=target_id, receiver=user, is_read=False).update(is_read=True)
+            except (ValueError, TypeError):
+                return base_qs.none()
+        elif channel == 'department' or recipient_isnull in {'true', 'True', '1'}:
+            # Kenh Chung Toan Khoa (broadcast: receiver is NULL)
+            if user.role == CustomUser.Role.ADMIN:
+                dept_filter = self.request.query_params.get('department')
+                if dept_filter:
+                    qs = base_qs.filter(receiver__isnull=True, department_id=dept_filter)
+                else:
+                    qs = base_qs.filter(receiver__isnull=True)
+            else:
+                qs = base_qs.filter(
+                    Q(receiver__isnull=True) &
+                    (Q(department=user.department) | Q(department__isnull=True) | Q(sender__role='ADMIN'))
+                )
+            # Auto mark broadcast messages as read for this user
+            unread_broadcasts = qs.exclude(sender=user)
+            for b_msg in unread_broadcasts:
+                readers = list(b_msg.read_by_users or [])
+                if user.id not in readers:
+                    readers.append(user.id)
+                    b_msg.read_by_users = readers
+                    b_msg.save(update_fields=['read_by_users'])
+        else:
+            # Mac dinh: Broadcast hop le HOAC tin 1-1 ma user la sender/receiver
+            if user.role == CustomUser.Role.ADMIN:
+                qs = base_qs.filter(
+                    Q(receiver__isnull=True) |
+                    Q(sender=user) |
+                    Q(receiver=user)
+                )
+            else:
+                qs = base_qs.filter(
+                    (Q(receiver__isnull=True) & (Q(department=user.department) | Q(department__isnull=True) | Q(sender__role='ADMIN'))) |
+                    Q(sender=user) |
+                    Q(receiver=user)
+                )
+
+        session_id = self.request.query_params.get('session')
+        if session_id:
+            qs = qs.filter(session_reference_id=session_id)
+
+        return qs.order_by('created_at')
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        receiver = serializer.validated_data.get('receiver')
+        if receiver:
+            dept = receiver.department or user.department
+        else:
+            dept = serializer.validated_data.get('department') or user.department
+
+        content = serializer.validated_data.get('content', '').strip()
+        att_type = serializer.validated_data.get('attachment_type')
+        att_file = serializer.validated_data.get('attachment_file')
+        metadata = serializer.validated_data.get('metadata') or {}
+
+        # Default content if empty
+        if not content:
+            if att_type == 'AUDIO':
+                content = '[🎤 Tin nhắn thoại]'
+            elif att_type == 'IMAGE':
+                content = '[📷 Hình ảnh]'
+            elif att_type == 'VIDEO':
+                content = '[🎥 Video]'
+            elif att_type == 'FILE':
+                content = '[📎 Tệp đính kèm]'
+            elif metadata.get('mentions'):
+                content = '[📋 Thẻ dữ liệu y tế]'
+            else:
+                content = '[Tin nhắn]'
+            serializer.validated_data['content'] = content
+
+        if att_file and not serializer.validated_data.get('attachment_name'):
+            serializer.validated_data['attachment_name'] = getattr(att_file, 'name', 'dinh_kem')
+
+        serializer.save(sender=user, department=dept)
+
+    @action(detail=False, methods=['post'], url_path='mark-read')
+    def mark_read(self, request):
+        user = request.user
+        target_id = request.data.get('target_id') or request.data.get('receiver')
+        channel = request.data.get('channel')
+
+        marked_count = 0
+        if target_id:
+            try:
+                tid = int(target_id)
+                marked_count = MedicalMessage.objects.filter(
+                    sender_id=tid, receiver=user, is_read=False
+                ).update(is_read=True)
+            except (ValueError, TypeError):
+                pass
+        elif channel == 'department':
+            from django.db.models import Q
+            if user.role == CustomUser.Role.ADMIN:
+                msgs = MedicalMessage.objects.filter(receiver__isnull=True).exclude(sender=user)
+            else:
+                msgs = MedicalMessage.objects.filter(
+                    Q(receiver__isnull=True) &
+                    (Q(department=user.department) | Q(department__isnull=True) | Q(sender__role='ADMIN'))
+                ).exclude(sender=user)
+            for msg in msgs:
+                current_readers = list(msg.read_by_users or [])
+                if user.id not in current_readers:
+                    current_readers.append(user.id)
+                    msg.read_by_users = current_readers
+                    msg.save(update_fields=['read_by_users'])
+                    marked_count += 1
+
+        return Response({'status': 'success', 'marked_count': marked_count}, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'], url_path='mention-suggestions')
+    def mention_suggestions(self, request):
+        q = request.query_params.get('q', '').strip()
+        from django.db.models import Q
+
+        # 1. Patients
+        patient_qs = Patient.objects.all().select_related('department')
+        if q:
+            patient_qs = patient_qs.filter(
+                Q(full_name__icontains=q) |
+                Q(patient_id__icontains=q) |
+                Q(phone_number__icontains=q)
+            )
+        patient_items = []
+        for p in patient_qs[:10]:
+            dept_label = p.department.name if p.department else "Khoa A"
+            patient_items.append({
+                'ref_type': 'PATIENT',
+                'id': p.pk,
+                'code': p.patient_id,
+                'title': f"Bệnh nhân: {p.full_name} ({p.patient_id})",
+                'subtitle': f"{dept_label} • Cân khô: {p.dry_weight or '--'} kg • TT: {p.status}",
+                'doc_summary': f"Hồ sơ bệnh án & Kết quả xét nghiệm mới nhất của {p.full_name}",
+                'link': f"/patients/{p.patient_id}",
+            })
+
+        # 2. Machines
+        machine_qs = DialysisMachine.objects.all().select_related('department')
+        if q:
+            machine_qs = machine_qs.filter(
+                Q(machine_id__icontains=q) |
+                Q(name__icontains=q)
+            )
+        machine_items = []
+        for m in machine_qs[:10]:
+            dept_label = m.department.name if m.department else "Chung"
+            machine_items.append({
+                'ref_type': 'MACHINE',
+                'id': m.pk,
+                'code': m.machine_id,
+                'title': f"Máy lọc: {m.name} ({m.machine_id})",
+                'subtitle': f"Khoa: {dept_label} • Trạng thái: {m.status}",
+                'doc_summary': f"Thông số kỹ thuật & Lịch bảo trì máy {m.machine_id}",
+                'link': "/machines",
+            })
+
+        # 3. Staff
+        staff_qs = CustomUser.objects.filter(is_active=True).select_related('department')
+        if q:
+            staff_qs = staff_qs.filter(
+                Q(username__icontains=q) |
+                Q(first_name__icontains=q) |
+                Q(last_name__icontains=q)
+            )
+        staff_items = []
+        for s in staff_qs[:10]:
+            full_name = f"{s.last_name} {s.first_name}".strip() or s.username
+            dept_label = s.department.name if s.department else "Toàn viện"
+            role_label = "Bác sĩ" if s.role == 'DOCTOR' else ("Điều dưỡng" if s.role == 'NURSE' else "Quản trị")
+            staff_items.append({
+                'ref_type': 'STAFF',
+                'id': s.id,
+                'code': s.username,
+                'title': f"Cán bộ y tế: {full_name} (@{s.username})",
+                'subtitle': f"Chức vụ: {role_label} • {dept_label}",
+                'doc_summary': f"Hồ sơ chuyên môn & Ca trực của {full_name}",
+                'link': "/staff",
+            })
+
+        return Response({
+            'patients': patient_items,
+            'machines': machine_items,
+            'staff': staff_items,
+            'all': patient_items + machine_items + staff_items,
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'])
+    def conversations(self, request):
+        user = request.user
+        now = dj_timezone.now()
+        from django.core.cache import cache
+        from django.db.models import Q
+
+        cache.set(f'user_online_{user.id}', True, timeout=300)
+        CustomUser.objects.filter(pk=user.pk).update(last_seen=now)
+
+        # 1. Pinned Channel
+        dept_name = user.department.name if user.department else "Toàn Viện"
+        channel_name = f"Kênh Chung - {dept_name}"
+
+        if user.role == CustomUser.Role.ADMIN:
+            last_broadcast = MedicalMessage.objects.filter(receiver__isnull=True).order_by('-created_at').first()
+            broadcast_qs = MedicalMessage.objects.filter(receiver__isnull=True).exclude(sender=user)
+        else:
+            last_broadcast = MedicalMessage.objects.filter(
+                Q(receiver__isnull=True) &
+                (Q(department=user.department) | Q(department__isnull=True) | Q(sender__role='ADMIN'))
+            ).order_by('-created_at').first()
+            broadcast_qs = MedicalMessage.objects.filter(
+                Q(receiver__isnull=True) &
+                (Q(department=user.department) | Q(department__isnull=True) | Q(sender__role='ADMIN'))
+            ).exclude(sender=user)
+
+        # Calculate unread for pinned channel
+        pinned_unread = 0
+        for b_msg in broadcast_qs.order_by('-created_at')[:50]:
+            if user.id not in (b_msg.read_by_users or []):
+                pinned_unread += 1
+
+        pinned_channel = {
+            'id': 'department',
+            'name': channel_name,
+            'pinned': True,
+            'unread_count': pinned_unread,
+            'last_message': f"{last_broadcast.sender.get_full_name() or last_broadcast.sender.username}: {last_broadcast.content}" if last_broadcast else "Chưa có thông báo nào",
+            'last_message_at': last_broadcast.created_at.isoformat() if last_broadcast else None,
+        }
+
+        # 2. Contacts / Conversations
+        contacts = []
+        all_users = CustomUser.objects.filter(is_active=True).exclude(pk=user.pk).select_related('department')
+
+        for u in all_users:
+            is_cached = bool(cache.get(f'user_online_{u.id}'))
+            is_recent = bool(u.last_seen and (now - u.last_seen).total_seconds() <= 300)
+            u_online = is_cached or is_recent
+
+            status_text = 'Đang hoạt động' if u_online else format_status_text(u.last_seen, now=now)
+            full_name = f"{u.last_name} {u.first_name}".strip() or u.username
+            u_dept_name = u.department.name if u.department else ('Toàn viện' if u.role == CustomUser.Role.ADMIN else 'Chưa phân khoa')
+
+            last_msg = MedicalMessage.objects.filter(
+                (Q(sender=user, receiver=u)) |
+                (Q(sender=u, receiver=user))
+            ).order_by('-created_at').first()
+
+            last_msg_content = last_msg.content if last_msg else None
+            is_last_from_me = (last_msg.sender_id == user.id) if last_msg else False
+            last_msg_at = last_msg.created_at.isoformat() if last_msg else None
+            last_seen_iso = u.last_seen.isoformat() if u.last_seen else None
+            last_seen_epoch = u.last_seen.timestamp() if u.last_seen else 0
+
+            # Count unread direct messages from u to current user
+            unread_count = MedicalMessage.objects.filter(sender=u, receiver=user, is_read=False).count()
+
+            contacts.append({
+                'id': u.id,
+                'username': u.username,
+                'full_name': full_name,
+                'role': u.role,
+                'department_id': u.department_id,
+                'department_name': u_dept_name,
+                'is_online': u_online,
+                'last_seen': last_seen_iso,
+                'last_seen_epoch': last_seen_epoch,
+                'status_text': status_text,
+                'unread_count': unread_count,
+                'last_message': last_msg_content,
+                'is_last_from_me': is_last_from_me,
+                'last_message_at': last_msg_at,
+            })
+
+        # Dynamic Sorting: Priority 1 = last_message_at desc; Priority 2 = is_online, last_seen, name
+        has_msg = sorted([c for c in contacts if c['last_message_at']], key=lambda x: x['last_message_at'], reverse=True)
+        no_msg = sorted([c for c in contacts if not c['last_message_at']], key=lambda x: (not x['is_online'], -x['last_seen_epoch'], x['full_name'].lower()))
+
+        ordered_conversations = has_msg + no_msg
+        total_unread = sum(c['unread_count'] for c in ordered_conversations) + pinned_unread
+
+        return Response({
+            'pinned_channel': pinned_channel,
+            'conversations': ordered_conversations,
+            'contacts': ordered_conversations,
+            'count_online': sum(1 for c in ordered_conversations if c['is_online']),
+            'total_unread': total_unread,
+        }, status=status.HTTP_200_OK)

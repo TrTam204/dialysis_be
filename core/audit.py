@@ -79,12 +79,15 @@ def calculate_changes(before_snapshot: dict, after_snapshot: dict) -> dict:
 
 
 def record_audit_log(actor, action: str, instance, changes: dict = None) -> AuditLog:
+    entity_type = instance.__class__.__name__
+    if entity_type == 'MedicalMessage':
+        return None
+
     if not getattr(actor, 'is_authenticated', False):
         log_actor = None
     else:
         log_actor = actor
 
-    entity_type = instance.__class__.__name__
     entity_id = str(instance.pk)
 
     if changes is None:

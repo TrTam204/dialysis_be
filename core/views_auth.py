@@ -8,7 +8,7 @@ from .services import forgot_password, login_user, logout_user, refresh_token, r
 @authentication_classes([])
 @permission_classes([AllowAny])
 def login_view(request):
-    return login_user(request.data)
+    return login_user(request.data, request=request)
 
 
 @api_view(['POST'])

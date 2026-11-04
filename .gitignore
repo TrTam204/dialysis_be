@@ -18,6 +18,9 @@ htmlcov/
 # Logs / generated
 *.log
 staticfiles/
+media/*
+!media/.gitkeep
+!media/**/.gitkeep
 
 # Environment / secrets
 .env

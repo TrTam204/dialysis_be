@@ -120,9 +120,10 @@ class CustomUser(AbstractUser):
     email = models.EmailField(unique=True)
     role = models.CharField(max_length=10, choices=Role.choices, default=Role.NURSE)
     phone_number = models.CharField(max_length=20, null=True, blank=True)
-    department = models.ForeignKey(Department, on_delete=models.PROTECT, related_name='staff')
+    department = models.ForeignKey(Department, on_delete=models.PROTECT, null=True, blank=True, related_name='staff')
     avatar_url = models.URLField(blank=True, null=True)
     is_active = models.BooleanField(default=True)
+    last_seen = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -210,6 +211,8 @@ class DialysisSession(models.Model):
     post_weight = models.FloatField(null=True, blank=True)
     uf_target = models.FloatField(null=True, blank=True)
     uf_actual = models.FloatField(null=True, blank=True)
+    is_emergency = models.BooleanField(default=False)
+    emergency_details = models.JSONField(default=dict, blank=True)
     clinical_notes = models.TextField(blank=True, default='')
     notes = models.TextField(blank=True, default='')
     created_at = models.DateTimeField(auto_now_add=True)
@@ -418,4 +421,52 @@ class ScheduleAssignment(models.Model):
 
     def __str__(self):
         return f'{self.patient_id} @ {self.machine_id} [{self.scheduled_date} {self.shift}]'
+
+
+class MedicalMessage(models.Model):
+    sender = models.ForeignKey(
+        CustomUser,
+        on_delete=models.CASCADE,
+        related_name='sent_medical_messages',
+    )
+    receiver = models.ForeignKey(
+        CustomUser,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='received_medical_messages',
+    )
+    department = models.ForeignKey(
+        Department,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='medical_messages',
+    )
+    content = models.TextField(blank=True, default='')
+    session_reference = models.ForeignKey(
+        DialysisSession,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='medical_messages',
+    )
+    is_read = models.BooleanField(default=False)
+    read_by_users = models.JSONField(default=list, blank=True)
+    attachment_file = models.FileField(upload_to='chat_attachments/%Y/%m/', null=True, blank=True)
+    attachment_type = models.CharField(max_length=20, null=True, blank=True)
+    attachment_name = models.CharField(max_length=255, null=True, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+        indexes = [
+            models.Index(fields=['department', 'created_at'], name='idx_msg_dept_created'),
+            models.Index(fields=['sender', 'receiver'], name='idx_msg_sender_receiver'),
+        ]
+
+    def __str__(self):
+        receiver_name = self.receiver.username if self.receiver else 'ALL'
+        return f"[{self.created_at:%H:%M}] {self.sender.username} -> {receiver_name}: {self.content[:30]}"
 

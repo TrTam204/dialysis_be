@@ -2,6 +2,8 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 
 from django.core.cache import cache
+from django.core.mail import send_mail
+from django.conf import settings
 from django.db.models import (
     Count,
     DurationField,
@@ -37,19 +39,105 @@ from django.db import transaction
 # Authentication services
 # ---------------------------------------------------------------------------
 
-def login_user(data):
+LOGIN_LOCKOUT_MAX_ATTEMPTS = 5
+LOGIN_LOCKOUT_TTL = 15 * 60  # 15 minutes
+
+
+def _get_client_ip(request):
+    if not request:
+        return '127.0.0.1'
+    x_forwarded = request.META.get('HTTP_X_FORWARDED_FOR')
+    if x_forwarded:
+        return x_forwarded.split(',')[0].strip()
+    return request.META.get('REMOTE_ADDR', '127.0.0.1')
+
+
+def login_user(data, request=None):
     username = data.get('username')
     password = data.get('password')
 
     if not username or not password:
         return Response({'detail': 'Username and password are required.'}, status=status.HTTP_400_BAD_REQUEST)
 
+    cache_key = f'login_attempts_{username}'
+    attempts = cache.get(cache_key, 0)
+    lockout_msg = 'Tài khoản đã bị tạm khóa 15 phút do nhập sai mật khẩu 5 lần liên tiếp. Email hướng dẫn khôi phục đã được gửi.'
+
+    if attempts >= LOGIN_LOCKOUT_MAX_ATTEMPTS:
+        return Response({
+            'detail': lockout_msg,
+            'remaining_attempts': 0,
+            'locked': True
+        }, status=status.HTTP_403_FORBIDDEN)
+
     user = CustomUser.objects.filter(username=username).first()
     if user is None or not user.check_password(password):
-        return Response({'detail': 'Invalid username or password.'}, status=status.HTTP_401_UNAUTHORIZED)
+        new_attempts = attempts + 1
+        cache.set(cache_key, new_attempts, timeout=LOGIN_LOCKOUT_TTL)
+
+        if new_attempts >= LOGIN_LOCKOUT_MAX_ATTEMPTS:
+            client_ip = _get_client_ip(request)
+            now_local = dj_timezone.localtime(dj_timezone.now())
+            now_str = now_local.strftime('%H:%M:%S • %d/%m/%Y')
+
+            if user and user.email:
+                subject = '[Trung Tâm Lọc Máu LocMau] Cảnh báo bảo mật: Phát hiện 5 lần đăng nhập không thành công'
+                body = (
+                    f"Kính gửi {user.last_name} {user.first_name} ({user.username}),\n\n"
+                    f"Hệ thống quản lý Trung tâm Lọc máu LocMau ghi nhận 5 lần đăng nhập không thành công liên tiếp vào tài khoản của bạn.\n\n"
+                    f"--- THÔNG TIN SỰ KIỆN ---\n"
+                    f"• Tên tài khoản: {user.username}\n"
+                    f"• Vai trò: {user.role}\n"
+                    f"• Thời gian vi phạm: {now_str} (Giờ địa phương Asia/Ho_Chi_Minh)\n"
+                    f"• Địa chỉ IP client: {client_ip}\n\n"
+                    f"--- HƯỚNG DẪN XỬ LÝ ---\n"
+                    f"1. Nếu chính bạn quên mật khẩu: Vui lòng truy cập chức năng 'Quên mật khẩu' trên website hoặc liên hệ Quản trị viên (Admin) trung tâm để được cấp lại.\n"
+                    f"2. Nếu KHÔNG phải bạn thực hiện: Đề nghị đổi mật khẩu ngay lập tức hoặc báo cho Admin khoa/phòng ban để bảo vệ hồ sơ bệnh án người bệnh.\n\n"
+                    f"Tài khoản hiện đang tạm khóa đăng nhập trong 15 phút.\n\n"
+                    f"Trân trọng,\nBan Quản trị An toàn Thông tin - Trung Tâm Lọc Máu LocMau"
+                )
+                from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', 'no-reply@dialysis.local')
+                try:
+                    send_mail(subject, body, from_email, [user.email], fail_silently=True)
+                except Exception:
+                    pass
+
+                record_audit_log(
+                    actor=user,
+                    action=AuditLog.Action.UPDATE,
+                    instance=user,
+                    changes={
+                        'security_alert': 'LOGIN_LOCKOUT_5_FAILED_ATTEMPTS',
+                        'attempts': new_attempts,
+                        'client_ip': client_ip,
+                        'timestamp': now_local.isoformat(),
+                    },
+                )
+            return Response({
+                'detail': lockout_msg,
+                'remaining_attempts': 0,
+                'locked': True
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        remaining = LOGIN_LOCKOUT_MAX_ATTEMPTS - new_attempts
+        return Response({
+            'detail': f'Sai tên đăng nhập hoặc mật khẩu. Bạn còn {remaining}/5 lần thử trước khi tài khoản bị tạm khóa 15 phút.',
+            'failed_attempts': new_attempts,
+            'remaining_attempts': remaining,
+            'max_attempts': LOGIN_LOCKOUT_MAX_ATTEMPTS
+        }, status=status.HTTP_401_UNAUTHORIZED)
 
     if not user.is_active:
         return Response({'detail': 'This account is disabled.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+    # Success: clear failed attempts
+    cache.delete(cache_key)
+
+    # Update online presence in cache and DB
+    now = dj_timezone.now()
+    cache.set(f'user_online_{user.id}', True, timeout=300)
+    user.last_seen = now
+    user.save(update_fields=['last_seen'])
 
     refresh = RefreshToken.for_user(user)
     return Response(
@@ -66,6 +154,7 @@ def login_user(data):
                 'department': user.department_id,
                 'department_name': user.department.name if user.department else None,
                 'phone_number': user.phone_number,
+                'last_seen': user.last_seen.isoformat() if user.last_seen else None,
             },
         },
         status=status.HTTP_200_OK,
