@@ -368,3 +368,97 @@ class FeatureUpgradeTests(TestCase):
         resp_conv_after = self.client.get("/api/chat/messages/conversations/")
         admin_conv_after = next((c for c in resp_conv_after.data["conversations"] if c["id"] == admin_user.id), None)
         self.assertEqual(admin_conv_after["unread_count"], 0, "Unread count must be 0 after reading messages")
+
+    def test_09_nurse_update_machine_status_and_maintenance_log_and_audit(self):
+        """Nurse in the same department can update machine status, maintenance log, and last maintenance date."""
+        self.client.force_authenticate(user=self.nurse_user)
+
+        patch_data = {
+            "status": "MAINTENANCE",
+            "maintenance_log": "Thay màng lọc và vệ sinh buồng máy sau sự cố kỹ thuật.",
+            "last_maintenance_date": "2026-11-05",
+        }
+        response = self.client.patch(f"/api/machines/{self.machine.machine_id}/", patch_data, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        self.machine.refresh_from_db()
+        self.assertEqual(self.machine.status, "MAINTENANCE")
+        self.assertEqual(self.machine.maintenance_log, "Thay màng lọc và vệ sinh buồng máy sau sự cố kỹ thuật.")
+        self.assertEqual(str(self.machine.last_maintenance_date), "2026-11-05")
+
+        # Verify AuditLog recorded
+        audit_entry = AuditLog.objects.filter(
+            entity_type="DialysisMachine",
+            entity_id=self.machine.machine_id,
+            action=AuditLog.Action.UPDATE,
+            actor=self.nurse_user,
+        ).first()
+        self.assertIsNotNone(audit_entry, "AuditLog must record machine update by nurse")
+        self.assertIn("status", audit_entry.changes)
+        self.assertEqual(audit_entry.changes["status"]["after"], "MAINTENANCE")
+
+    def test_10_nurse_forbidden_actions_on_machines(self):
+        """Nurse is forbidden from deleting, creating, altering identifying fields, or updating another dept machine."""
+        self.client.force_authenticate(user=self.nurse_user)
+
+        # 1. Nurse cannot DELETE machine (403)
+        res_del = self.client.delete(f"/api/machines/{self.machine.machine_id}/")
+        self.assertEqual(res_del.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 2. Nurse cannot POST create machine (403)
+        res_create = self.client.post("/api/machines/", {
+            "machine_id": "MAC_NURSE_NEW",
+            "name": "Máy do Nurse tạo",
+            "department": self.dept.id,
+            "status": "AVAILABLE",
+        }, format="json")
+        self.assertEqual(res_create.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 3. Nurse cannot PATCH name (403)
+        res_patch_name = self.client.patch(f"/api/machines/{self.machine.machine_id}/", {
+            "name": "Tên máy bị sửa trái phép",
+        }, format="json")
+        self.assertEqual(res_patch_name.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 4. Nurse cannot PATCH machine_id (403)
+        res_patch_id = self.client.patch(f"/api/machines/{self.machine.machine_id}/", {
+            "machine_id": "MAC_HACKED",
+        }, format="json")
+        self.assertEqual(res_patch_id.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 5. Nurse cannot update machine belonging to another department (403)
+        machine_dept2 = DialysisMachine.objects.create(
+            machine_id="MAC_DEPT2_01",
+            name="Máy Khoa B",
+            department=self.dept2,
+            status=DialysisMachine.Status.AVAILABLE,
+        )
+        res_patch_other = self.client.patch(f"/api/machines/{machine_dept2.machine_id}/", {
+            "status": "MAINTENANCE",
+            "maintenance_log": "Nurse Khoa A sửa máy Khoa B",
+        }, format="json")
+        self.assertEqual(res_patch_other.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_11_topsis_c5_distance_uses_cho_ray_center_coordinates(self):
+        """TOPSIS criteria C5 distance must use Cho Ray hospital coordinates (10.7556, 106.6602)."""
+        from core.topsis_service import TopsisTriageService
+
+        self.assertEqual(TopsisTriageService.DEFAULT_CENTER_LAT, 10.7556)
+        self.assertEqual(TopsisTriageService.DEFAULT_CENTER_LON, 106.6602)
+
+        # Test patient located exactly at Cho Ray Hospital: distance should be 0.0 km
+        patient_at_hospital = Patient.objects.create(
+            patient_id="PAT_CHORAY",
+            full_name="Bệnh Nhân Tại Chợ Rẫy",
+            date_of_birth="1985-05-05",
+            gender="FEMALE",
+            dry_weight=52.0,
+            department=self.dept,
+            status=Patient.Status.ACTIVE,
+            location=Point(106.6602, 10.7556, srid=4326),
+        )
+        features, meta = TopsisTriageService.extract_patient_features(patient_at_hospital)
+        # C5 is index 4
+        c5_dist = features[4]
+        self.assertAlmostEqual(c5_dist, 0.0, places=2, msg="Patient at hospital coordinates must have 0.0 km distance")
+

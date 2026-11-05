@@ -27,6 +27,7 @@ from .models import (
 from .permissions import (
     IsAdmin,
     IsAdminOrDoctor,
+    IsAdminOrNurseMachineMaintenance,
     IsNurseAssignedSessionStatusOnly,
     IsNurseAssignedSessionVitals,
     IsNursePatientStatusOnly,
@@ -192,8 +193,10 @@ class DialysisMachineViewSet(BaseRoleAwareViewSet):
     ordering = ['machine_id']
 
     def get_permissions(self):
-        if self.action in {'create', 'update', 'partial_update', 'destroy'}:
+        if self.action in {'create', 'destroy'}:
             self.permission_classes = [permissions.IsAuthenticated, IsAdmin]
+        elif self.action in {'update', 'partial_update'}:
+            self.permission_classes = [permissions.IsAuthenticated, IsAdminOrNurseMachineMaintenance]
         else:
             self.permission_classes = [permissions.IsAuthenticated, IsStaffMember]
         return super().get_permissions()

@@ -251,13 +251,13 @@ class TopsisTriageService:
             "default_value": 5.0,
             "min_val": 0.1,
             "max_val": 100.0,
-            "description": "Khoảng cách trắc địa từ tọa độ bệnh nhân (PostGIS Point) đến trung tâm/khoa lọc máu. Khoảng cách gần hơn giúp bệnh nhân dễ tiếp cận ca cấp cứu nhanh hơn.",
+            "description": "Khoảng cách trắc địa từ tọa độ bệnh nhân (PostGIS Point) đến trung tâm/khoa lọc máu Bệnh viện Chợ Rẫy TP.HCM (10.7556, 106.6602). Khoảng cách gần hơn giúp bệnh nhân dễ tiếp cận ca cấp cứu nhanh hơn.",
         },
     ]
 
-    # Reference coordinates for Dialysis Center (TP. Ho Chi Minh: 10.7769° N, 106.7009° E)
-    DEFAULT_CENTER_LAT = 10.7769
-    DEFAULT_CENTER_LON = 106.7009
+    # Reference coordinates for Dialysis Center (Bệnh viện Chợ Rẫy TP.HCM: 10.7556° N, 106.6602° E)
+    DEFAULT_CENTER_LAT = 10.7556
+    DEFAULT_CENTER_LON = 106.6602
 
     @classmethod
     def get_criteria_catalogue(cls) -> List[Dict[str, Any]]:

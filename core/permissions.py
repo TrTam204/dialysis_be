@@ -136,5 +136,56 @@ class IsNurseAssignedSessionVitals(permissions.BasePermission):
         return obj.session.assigned_nurse_id == request.user.id
 
 
+class IsAdminOrNurseMachineMaintenance(permissions.BasePermission):
+    """
+    Allows ADMIN full update access.
+    Allows NURSE (and DOCTOR) to update machine status and maintenance log
+    only for machines in their department, without modifying identifying fields.
+    """
+    message = 'Forbidden: Only ADMIN or assigned department staff may update machine status/maintenance.'
+
+    ALLOWED_NURSE_FIELDS = {'status', 'maintenance_log', 'last_maintenance_date'}
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not (user and user.is_authenticated):
+            return False
+        if user.role == 'ADMIN':
+            return True
+        if user.role in {'NURSE', 'DOCTOR'}:
+            if request.method not in {'PUT', 'PATCH'}:
+                return False
+            if user.role == 'NURSE' and request.method == 'PATCH':
+                data = request.data if isinstance(request.data, dict) else {}
+                if not (set(data.keys()) <= self.ALLOWED_NURSE_FIELDS):
+                    self.message = 'Forbidden: NURSE may only update status, maintenance_log, and last_maintenance_date.'
+                    return False
+            return True
+        return False
+
+    def has_object_permission(self, request, view, obj):
+        user = request.user
+        if user.role == 'ADMIN':
+            return True
+        if user.role in {'NURSE', 'DOCTOR'}:
+            if user.department_id and obj.department_id != user.department_id:
+                self.message = 'Forbidden: Cannot update machine belonging to another department.'
+                return False
+            if user.role == 'NURSE':
+                data = request.data if isinstance(request.data, dict) else {}
+                for field in ('machine_id', 'name'):
+                    if field in data and str(data[field]).strip() != str(getattr(obj, field, '')).strip():
+                        self.message = f'Forbidden: NURSE cannot alter {field}.'
+                        return False
+                if 'department' in data:
+                    dept_val = data['department']
+                    target_dept_id = dept_val if isinstance(dept_val, (int, type(None))) else (dept_val.get('id') if isinstance(dept_val, dict) else dept_val)
+                    if target_dept_id != obj.department_id:
+                        self.message = 'Forbidden: NURSE cannot alter machine department.'
+                        return False
+            return True
+        return False
+
+
 def enforce_role_error_message(required_roles):
     return f'Forbidden: required role(s): {", ".join(required_roles)}.'
