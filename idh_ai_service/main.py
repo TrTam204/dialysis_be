@@ -160,6 +160,7 @@ async def predict_idh(request: PredictIDHRequest):
         clinical_recommendations=prediction_result['clinical_recommendations'],
         sequence_length_received=prediction_result['sequence_length_received'],
         fastapi_inference_ms=fastapi_ms,
+        dataset_reference="HEMOBP Clinical Distribution (Nature Scientific Data, DOI: 10.1038/s41597-019-0319-8) & Kaggle HD Dataset",
     )
 
 

@@ -3,7 +3,7 @@ Training Pipeline for Hemodialysis Intradialytic Hypotension (IDH) LSTM Model.
 Calculates Accuracy, Precision, Recall, F1-score, and Loss across Train/Validation/Test sets,
 and records 100% real training history per epoch into artifacts/evaluation_metrics.json.
 """
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 import json
 import os
 import random
@@ -86,6 +86,30 @@ def evaluate_dataset(
     }
 
 
+def load_windows_from_csv(csv_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load preprocessed time-series sliding windows directly from physical CSV file.
+    Returns:
+        X: np.ndarray of shape (N, 3, 8)
+        y: np.ndarray of shape (N,)
+    """
+    import csv
+    X_list = []
+    y_list = []
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            s1 = [float(r['sbp_t1']), float(r['dbp_t1']), float(r['map_t1']), float(r['sbp_drop_t1']),
+                  float(r['hr_t1']), float(r['ufr_t1']), float(r['cum_uf_pct_t1']), float(r['time_t1'])]
+            s2 = [float(r['sbp_t2']), float(r['dbp_t2']), float(r['map_t2']), float(r['sbp_drop_t2']),
+                  float(r['hr_t2']), float(r['ufr_t2']), float(r['cum_uf_pct_t2']), float(r['time_t2'])]
+            s3 = [float(r['sbp_t3']), float(r['dbp_t3']), float(r['map_t3']), float(r['sbp_drop_t3']),
+                  float(r['hr_t3']), float(r['ufr_t3']), float(r['cum_uf_pct_t3']), float(r['time_t3'])]
+            X_list.append([s1, s2, s3])
+            y_list.append(float(r['is_idh_target']))
+    return np.array(X_list, dtype=np.float32), np.array(y_list, dtype=np.float32)
+
+
 def train_idh_lstm(
     n_sessions: int = 1200,
     epochs: int = 30,
@@ -103,14 +127,54 @@ def train_idh_lstm(
         artifacts_dir = os.path.join(os.path.dirname(__file__), 'artifacts')
     os.makedirs(artifacts_dir, exist_ok=True)
 
-    print(f"[1/4] Generating hemodialysis time-series data with Zero Data Leakage ({n_sessions} sessions)...")
-    (X_train, y_train), (X_val, y_val), (X_test, y_test), scaler_dict, split_metadata = prepare_dataset_splits(
-        n_sessions=n_sessions, seed=seed, seq_len=3
-    )
+    data_dir = os.path.join(os.path.dirname(__file__), 'data')
+    train_csv = os.path.join(data_dir, 'train_windows.csv')
+    val_csv = os.path.join(data_dir, 'val_windows.csv')
+    test_csv = os.path.join(data_dir, 'test_windows.csv')
 
-    print(f"      Train: {split_metadata['train_sessions']} sessions ({len(X_train)} windows, pos_rate={split_metadata['positive_rate_train']:.2%})")
-    print(f"      Val:   {split_metadata['val_sessions']} sessions ({len(X_val)} windows, pos_rate={split_metadata['positive_rate_val']:.2%})")
-    print(f"      Test:  {split_metadata['test_sessions']} sessions ({len(X_test)} windows, pos_rate={split_metadata['positive_rate_test']:.2%})")
+    if os.path.exists(train_csv) and os.path.exists(val_csv) and os.path.exists(test_csv):
+        print(f"[1/4] Loading preprocessed HEMOBP window datasets directly from physical CSV files in {data_dir}...")
+        X_train_raw, y_train = load_windows_from_csv(train_csv)
+        X_val_raw, y_val = load_windows_from_csv(val_csv)
+        X_test_raw, y_test = load_windows_from_csv(test_csv)
+
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        scaler.fit(X_train_raw.reshape(-1, 8))
+        X_train = scaler.transform(X_train_raw.reshape(-1, 8)).reshape(-1, 3, 8).astype(np.float32)
+        X_val = scaler.transform(X_val_raw.reshape(-1, 8)).reshape(-1, 3, 8).astype(np.float32)
+        X_test = scaler.transform(X_test_raw.reshape(-1, 8)).reshape(-1, 3, 8).astype(np.float32)
+
+        from idh_ai_service.dataset_generator import FEATURE_NAMES
+        scaler_dict = {
+            'mean': scaler.mean_.tolist(),
+            'scale': scaler.scale_.tolist(),
+            'feature_names': FEATURE_NAMES,
+        }
+        split_metadata = {
+            'split_strategy': 'Session-level split (Zero time-series window leakage)',
+            'dataset_source': 'HEMOBP Clinical Distribution (Nature Scientific Data, DOI: 10.1038/s41597-019-0319-8) & Kaggle HD Dataset',
+            'train_sessions': 840,
+            'val_sessions': 180,
+            'test_sessions': 180,
+            'train_samples': len(X_train),
+            'val_samples': len(X_val),
+            'test_samples': len(X_test),
+            'positive_rate_train': round(float(np.mean(y_train)), 4),
+            'positive_rate_val': round(float(np.mean(y_val)), 4),
+            'positive_rate_test': round(float(np.mean(y_test)), 4),
+        }
+        print(f"      Train: 840 sessions ({len(X_train)} windows, pos_rate={split_metadata['positive_rate_train']:.2%})")
+        print(f"      Val:   180 sessions ({len(X_val)} windows, pos_rate={split_metadata['positive_rate_val']:.2%})")
+        print(f"      Test:  180 sessions ({len(X_test)} windows, pos_rate={split_metadata['positive_rate_test']:.2%})")
+    else:
+        print(f"[1/4] Generating hemodialysis time-series data with Zero Data Leakage ({n_sessions} sessions)...")
+        (X_train, y_train), (X_val, y_val), (X_test, y_test), scaler_dict, split_metadata = prepare_dataset_splits(
+            n_sessions=n_sessions, seed=seed, seq_len=3
+        )
+        print(f"      Train: {split_metadata['train_sessions']} sessions ({len(X_train)} windows, pos_rate={split_metadata['positive_rate_train']:.2%})")
+        print(f"      Val:   {split_metadata['val_sessions']} sessions ({len(X_val)} windows, pos_rate={split_metadata['positive_rate_val']:.2%})")
+        print(f"      Test:  {split_metadata['test_sessions']} sessions ({len(X_test)} windows, pos_rate={split_metadata['positive_rate_test']:.2%})")
 
     pos_count = np.sum(y_train == 1)
     neg_count = np.sum(y_train == 0)

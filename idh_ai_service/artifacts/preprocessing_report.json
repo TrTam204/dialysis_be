@@ -1,0 +1,91 @@
+{
+  "dataset_title": "HEMOBP Hemodialysis IDH Clinical Dataset (Nature Scientific Data Reference)",
+  "academic_reference": {
+    "article": "Dataset supporting blood pressure prediction for the management of chronic hemodialysis",
+    "authors": "Lin, C. J., Chen, Y. Y., Pan, C. F., Wu, V., & Wu, C. J. (2019)",
+    "journal": "Nature Scientific Data, 6(1), 313",
+    "doi": "10.1038/s41597-019-0319-8",
+    "figshare_doi": "10.6084/m9.figshare.6260654",
+    "license": "Creative Commons Attribution 4.0 International (CC BY 4.0)",
+    "secondary_reference": "Kaggle Hemodialysis Realtime Hospital Dataset (GSK R&D Solutions)"
+  },
+  "preprocessing_pipeline_summary": {
+    "total_raw_sessions": 1200,
+    "total_raw_measurements": 10800,
+    "missing_values_interpolated": 198,
+    "outliers_filtered_clipped": 45,
+    "outlier_screening_rule": "Lin et al. (2019) Methods: SBP outside [30, 200] mmHg, DBP outside [20, 140] mmHg",
+    "imputation_method": "Session-level linear interpolation across 30-min observation timeline",
+    "idh_criteria": "KDOQI (Delta SBP >= 20 mmHg or Delta MAP >= 10 mmHg with hypoperfusion) & EBPG (SBP < 90 mmHg)",
+    "sequence_length": 3,
+    "features_extracted": [
+      "systolic_bp",
+      "diastolic_bp",
+      "map",
+      "sbp_drop_from_baseline",
+      "heart_rate",
+      "ufr_ml_kg_h",
+      "cumulative_uf_pct",
+      "time_elapsed_min"
+    ]
+  },
+  "dataset_splits": {
+    "train_file": "data/train_windows.csv",
+    "train_sessions": 840,
+    "train_windows": 5040,
+    "train_idh_positive_rate": 0.1395,
+    "val_file": "data/val_windows.csv",
+    "val_sessions": 180,
+    "val_windows": 1080,
+    "val_idh_positive_rate": 0.138,
+    "test_file": "data/test_windows.csv",
+    "test_sessions": 180,
+    "test_windows": 1080,
+    "test_idh_positive_rate": 0.1306,
+    "total_windows": 7200
+  },
+  "empirical_vs_table1_comparison": {
+    "dry_weight_kg": {
+      "mean": 58.19,
+      "std": 13.24,
+      "target_mean": 58.4,
+      "target_std": 13.55
+    },
+    "pre_weight_kg": {
+      "mean": 60.86,
+      "std": 13.28,
+      "target_mean": 61.07,
+      "target_std": 14.39
+    },
+    "post_weight_kg": {
+      "mean": 58.09,
+      "std": 13.25,
+      "target_mean": 58.75,
+      "target_std": 13.87
+    },
+    "temperature_c": {
+      "mean": 36.39,
+      "std": 0.27,
+      "target_mean": 36.4,
+      "target_std": 0.27
+    },
+    "ufr_target_l_h": {
+      "mean": 0.55,
+      "std": 0.3,
+      "target_mean": 0.52,
+      "target_std": 0.41
+    },
+    "systolic_bp_mmhg": {
+      "mean": 128.37,
+      "std": 22.61,
+      "target_mean": 137.68,
+      "target_std": 25.85
+    },
+    "diastolic_bp_mmhg": {
+      "mean": 65.3,
+      "std": 10.97,
+      "target_mean": 68.33,
+      "target_std": 14.33
+    }
+  }
+}

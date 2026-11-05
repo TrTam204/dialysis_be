@@ -224,6 +224,7 @@ def run_benchmark():
                 "risk_level": body.get("risk_level"),
                 "risk_probability": round(body.get("risk_probability", 0.0), 4),
                 "is_idh_predicted": body.get("is_idh_predicted"),
+                "dataset_reference": body.get("dataset_reference"),
                 "round_trip_latency_ms": round(rt_ms, 2),
                 "fastapi_inference_ms": round(fa_ms, 2),
                 "status": "SUCCESS",

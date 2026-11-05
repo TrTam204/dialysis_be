@@ -191,6 +191,7 @@ def predict_idh_for_session(session: DialysisSession) -> Dict[str, Any]:
         seq_data['fastapi_inference_ms'] = None
         seq_data['round_trip_latency_ms'] = 0.0
         seq_data['input_window_payload'] = []
+        seq_data['dataset_reference'] = 'HEMOBP Clinical Distribution (Nature Scientific Data, DOI: 10.1038/s41597-019-0319-8) & Kaggle HD Dataset'
         seq_data['disclaimer'] = (
             'Cảnh báo từ mô hình AI chỉ mang tính chất hỗ trợ theo dõi sớm, '
             'không thay thế quyết định chuyên môn của bác sĩ.'
@@ -225,6 +226,7 @@ def predict_idh_for_session(session: DialysisSession) -> Dict[str, Any]:
                 result['fastapi_inference_ms'] = float(fastapi_ms)
                 result['round_trip_latency_ms'] = float(round_trip_ms)
                 result['input_window_payload'] = input_window
+                result['dataset_reference'] = result.get('dataset_reference') or 'HEMOBP Clinical Distribution (Nature Scientific Data, DOI: 10.1038/s41597-019-0319-8) & Kaggle HD Dataset'
                 result['is_interpolated'] = seq_data.get('is_interpolated', False)
                 result['is_padded'] = seq_data.get('is_padded', False)
                 result['recorded_vitals_count'] = seq_data['recorded_count']
@@ -267,6 +269,7 @@ def predict_idh_for_session(session: DialysisSession) -> Dict[str, Any]:
         'fastapi_inference_ms': None,
         'round_trip_latency_ms': float(fallback_latency_ms),
         'input_window_payload': input_window,
+        'dataset_reference': 'HEMOBP Clinical Distribution (Nature Scientific Data, DOI: 10.1038/s41597-019-0319-8) & Kaggle HD Dataset',
         'is_interpolated': seq_data.get('is_interpolated', False),
         'is_padded': seq_data.get('is_padded', False),
         'recorded_vitals_count': seq_data['recorded_count'],

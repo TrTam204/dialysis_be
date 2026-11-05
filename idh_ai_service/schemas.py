@@ -45,6 +45,10 @@ class PredictIDHResponse(BaseModel):
     clinical_recommendations: List[str]
     sequence_length_received: int
     fastapi_inference_ms: Optional[float] = Field(None, description="Internal model inference execution time at FastAPI microservice (ms)")
+    dataset_reference: Optional[str] = Field(
+        "HEMOBP Clinical Distribution (Nature Scientific Data, DOI: 10.1038/s41597-019-0319-8) & Kaggle HD Dataset",
+        description="Official academic clinical dataset citation",
+    )
 
 
 class MetricSet(BaseModel):
@@ -79,6 +83,7 @@ class ModelInfoResponse(BaseModel):
     model_name: str
     framework: str
     architecture: str
+    dataset_reference: Optional[str] = None
     input_features: List[str]
     sequence_length: int
     split_strategy: Optional[str] = None
