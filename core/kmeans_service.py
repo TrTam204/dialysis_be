@@ -136,6 +136,7 @@ class KMeansClusteringService:
             features.append({
                 'patient_id': p.patient_id,
                 'full_name': p.full_name,
+                'status': getattr(p, 'status', 'ACTIVE'),
                 'dry_weight': dry_w,
                 'raw_features': raw_dict,
                 'is_imputed': is_imputed,
@@ -188,6 +189,7 @@ class KMeansClusteringService:
             normalized.append({
                 'patient_id': p['patient_id'],
                 'full_name': p['full_name'],
+                'status': p.get('status', 'ACTIVE'),
                 'dry_weight': p['dry_weight'],
                 'raw_features': p['raw_features'],
                 'normalized_vector': norm_vector,
@@ -536,12 +538,29 @@ class KMeansClusteringService:
             cluster_label = f'Cụm {c_idx + 1}: {label_traits}'
 
             # Risk level and neutral recommendations
-            if k_val >= 5.5 or idwg_val >= 4.5 or hb_val < 9.0:
+            if k_val >= 5.5:
                 risk_level = 'HIGH'
                 recommendation = (
-                    f'Nhóm cần chú ý lâm sàng: %IDWG TB {idwg_val:.1f}%, '
-                    f'Kali TB {k_val:.2f} mmol/L, Hb TB {hb_val:.1f} g/dL. '
-                    'Khuyến nghị đánh giá lại cân nặng khô và tư vấn chế độ ăn giảm Kali.'
+                    f'Nhóm nguy cơ cao tăng Kali huyết (TB {k_val:.2f} mmol/L). '
+                    'Khuyến nghị điều chỉnh nồng độ Kali dịch lọc (K+ bath), theo dõi sát điện tim và tư vấn chế độ ăn giảm Kali nghiêm ngặt.'
+                )
+            elif idwg_val >= 5.0 and k_val >= 5.2:
+                risk_level = 'HIGH'
+                recommendation = (
+                    f'Nhóm nguy cơ tim mạch phức hợp: Tăng cân gian lọc cao (%IDWG {idwg_val:.1f}%) kết hợp Kali máu cao ({k_val:.2f} mmol/L). '
+                    'Cần đánh giá lại cân nặng khô và tư vấn giảm dịch/muối đưa vào.'
+                )
+            elif idwg_val >= 4.5:
+                risk_level = 'MEDIUM'
+                recommendation = (
+                    f'Nhóm tăng cân gian lọc cao (%IDWG TB {idwg_val:.1f}%), Kali ổn định ({k_val:.2f} mmol/L). '
+                    'Khuyến nghị đánh giá lại cân nặng khô, kiểm soát lượng muối/nước đưa vào giữa 2 kỳ lọc.'
+                )
+            elif hb_val < 9.5:
+                risk_level = 'MEDIUM'
+                recommendation = (
+                    f'Nhóm thiếu máu rõ rệt (Hb TB {hb_val:.1f} g/dL), Kali ({k_val:.2f} mmol/L) và %IDWG ({idwg_val:.1f}%) bình thường. '
+                    'Khuyến nghị tối ưu hóa liều ESA (EPO), bổ sung sắt tĩnh mạch và kiểm tra dự trữ sắt (Ferritin, TSAT).'
                 )
             elif hb_val < 10.5 or k_val > 5.0 or idwg_val > 3.5:
                 risk_level = 'MEDIUM'
@@ -665,10 +684,18 @@ class KMeansClusteringService:
                     'patient_id': p['patient_id'],
                     'full_name': p['full_name'],
                     'dry_weight': p['dry_weight'],
+                    'status': p.get('status', 'ACTIVE'),
                     'raw_features': p['raw_features'],
+                    'features': p['raw_features'],  # Dual-compatibility for frontend
                     'normalized_vector': p['normalized_vector'],
                     'normalized_dict': p['normalized_dict'],
                     'cluster': c_idx,
+                    'cluster_id': c_idx,  # Dual-compatibility for frontend
+                    'age': p['raw_features'].get('age'),
+                    'avg_hemoglobin': p['raw_features'].get('avg_hemoglobin'),
+                    'avg_potassium': p['raw_features'].get('avg_potassium'),
+                    'avg_idwg_pct': p['raw_features'].get('avg_idwg_pct'),
+                    'avg_uf': p['raw_features'].get('avg_uf'),
                     'is_imputed': p['is_imputed'],
                     'imputed_fields': p['imputed_fields'],
                 }
