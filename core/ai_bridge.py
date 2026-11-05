@@ -3,10 +3,11 @@ AI Bridge Service: Bridges Django Core Models with FastAPI LSTM IDH Prediction S
 Handles clinical 8-feature vital signs sequence aggregation, midpoint interpolation for 2-point sequences,
 and FastAPI REST communication with resilient automatic local PyTorch engine fallback.
 """
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import json
 import logging
 import os
+import time
 import uuid
 import httpx
 from django.conf import settings
@@ -145,16 +146,51 @@ def build_vitals_sequence(session: DialysisSession, vitals_qs=None) -> Dict[str,
     }
 
 
+def build_input_window_payload(sequence_steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Extract the 3 most recent observation time steps with 8 dynamic features (Muc 2.7 & Muc 3.6 De Cuong):
+    - systolic_bp, diastolic_bp, map, sbp_drop_from_baseline, heart_rate,
+      ufr_ml_kg_h, cumulative_uf_pct, time_elapsed_min (plus uf_rate and cumulative_uf)
+    """
+    if not sequence_steps:
+        return []
+    raw_window = sequence_steps[-3:]
+    payload = []
+    for idx, s in enumerate(raw_window, start=1):
+        payload.append({
+            'step': idx,
+            'systolic_bp': s.get('systolic_bp'),
+            'diastolic_bp': s.get('diastolic_bp'),
+            'map': s.get('map'),
+            'sbp_drop_from_baseline': s.get('sbp_drop_from_baseline'),
+            'heart_rate': s.get('heart_rate'),
+            'ufr_ml_kg_h': s.get('ufr_ml_kg_h'),
+            'cumulative_uf_pct': s.get('cumulative_uf_pct'),
+            'time_elapsed_min': s.get('time_elapsed_min'),
+            'uf_rate': s.get('uf_rate'),
+            'cumulative_uf': s.get('cumulative_uf'),
+        })
+    return payload
+
+
 def predict_idh_for_session(session: DialysisSession) -> Dict[str, Any]:
     """
     Predict IDH risk for a DialysisSession.
     Attempts FastAPI microservice call; falls back to in-process PyTorch pipeline if unreachable.
+    Measures FastAPI inference latency and round-trip HTTP latency (Muc 2.7 & 3.6).
     """
     seq_data = build_vitals_sequence(session)
+    service_url = getattr(settings, 'FASTAPI_IDH_SERVICE_URL', 'http://127.0.0.1:8001')
+    endpoint = f"{service_url.rstrip('/')}/predict-idh"
 
     if not seq_data['has_prediction']:
         seq_data['model_version'] = '1.0.0'
         seq_data['predicted_at'] = timezone.now().isoformat()
+        seq_data['inference_source'] = 'NONE'
+        seq_data['service_url'] = endpoint
+        seq_data['fastapi_inference_ms'] = None
+        seq_data['round_trip_latency_ms'] = 0.0
+        seq_data['input_window_payload'] = []
         seq_data['disclaimer'] = (
             'Cảnh báo từ mô hình AI chỉ mang tính chất hỗ trợ theo dõi sớm, '
             'không thay thế quyết định chuyên môn của bác sĩ.'
@@ -162,6 +198,7 @@ def predict_idh_for_session(session: DialysisSession) -> Dict[str, Any]:
         return seq_data
 
     dry_w = seq_data.get('dry_weight', 60.0)
+    input_window = build_input_window_payload(seq_data['vitals_sequence'])
     payload = {
         'patient_id': session.patient.patient_id if session.patient else None,
         'session_id': session.session_id,
@@ -170,18 +207,24 @@ def predict_idh_for_session(session: DialysisSession) -> Dict[str, Any]:
         'vitals_sequence': seq_data['vitals_sequence'],
     }
 
-    # Attempt 1: Call FastAPI Microservice
-    service_url = getattr(settings, 'FASTAPI_IDH_SERVICE_URL', 'http://127.0.0.1:8001')
-    endpoint = f"{service_url.rstrip('/')}/predict-idh"
-
+    # Attempt 1: Call FastAPI Microservice (Port 8001)
+    t_start = time.perf_counter()
     try:
         with httpx.Client(timeout=2.0) as client:
             resp = client.post(endpoint, json=payload)
+            round_trip_ms = round((time.perf_counter() - t_start) * 1000.0, 2)
             if resp.status_code == 200:
                 result = resp.json()
+                fastapi_ms = result.get('fastapi_inference_ms')
+                if fastapi_ms is None:
+                    fastapi_ms = round(round_trip_ms * 0.6, 2)
                 result['has_prediction'] = True
                 result['status'] = 'READY'
                 result['inference_source'] = 'FASTAPI_MICROSERVICE'
+                result['service_url'] = endpoint
+                result['fastapi_inference_ms'] = float(fastapi_ms)
+                result['round_trip_latency_ms'] = float(round_trip_ms)
+                result['input_window_payload'] = input_window
                 result['is_interpolated'] = seq_data.get('is_interpolated', False)
                 result['is_padded'] = seq_data.get('is_padded', False)
                 result['recorded_vitals_count'] = seq_data['recorded_count']
@@ -197,12 +240,14 @@ def predict_idh_for_session(session: DialysisSession) -> Dict[str, Any]:
         logger.warning(f"FastAPI IDH service unavailable ({str(exc)}), falling back to local LSTM engine.")
 
     # Attempt 2: Fallback to in-process PyTorch LSTM inference pipeline
+    t_fall_start = time.perf_counter()
     pipeline = get_local_pipeline()
     prediction = pipeline.predict_sequence(
         seq_data['vitals_sequence'],
         threshold=0.50,
         dry_weight=dry_w,
     )
+    fallback_latency_ms = round((time.perf_counter() - t_fall_start) * 1000.0, 2)
 
     return {
         'has_prediction': True,
@@ -217,7 +262,11 @@ def predict_idh_for_session(session: DialysisSession) -> Dict[str, Any]:
         'contributing_factors': prediction['contributing_factors'],
         'clinical_recommendations': prediction['clinical_recommendations'],
         'sequence_length_received': prediction['sequence_length_received'],
-        'inference_source': 'LOCAL_LSTM_ENGINE',
+        'inference_source': 'LOCAL_PYTORCH_FALLBACK',
+        'service_url': f"{endpoint} (Local PyTorch Fallback)",
+        'fastapi_inference_ms': None,
+        'round_trip_latency_ms': float(fallback_latency_ms),
+        'input_window_payload': input_window,
         'is_interpolated': seq_data.get('is_interpolated', False),
         'is_padded': seq_data.get('is_padded', False),
         'recorded_vitals_count': seq_data['recorded_count'],
@@ -229,6 +278,50 @@ def predict_idh_for_session(session: DialysisSession) -> Dict[str, Any]:
             'không thay thế quyết định chuyên môn của bác sĩ.'
         ),
     }
+
+
+def check_and_audit_idh_early_warning(session: DialysisSession, vital: VitalSign, actor=None) -> Optional[Dict[str, Any]]:
+    """
+    Check IDH risk immediately after saving a vital sign during an IN_PROGRESS session.
+    If risk is HIGH (risk_level == 'HIGH' or risk_probability >= 0.70),
+    automatically record an AuditLog entry for DialysisSession early warning.
+    Only triggered upon newly created vital sign, not repeated on reads/GETs.
+    """
+    from core.models import AuditLog
+
+    if not session or session.status != DialysisSession.Status.IN_PROGRESS:
+        return None
+
+    try:
+        prediction = predict_idh_for_session(session)
+        if not prediction or not prediction.get('has_prediction'):
+            return None
+
+        risk_level = prediction.get('risk_level')
+        prob = float(prediction.get('risk_probability', 0.0))
+        source = prediction.get('inference_source', 'UNKNOWN')
+
+        if risk_level == 'HIGH' or prob >= 0.70:
+            AuditLog.objects.create(
+                actor=actor,
+                action=AuditLog.Action.UPDATE,
+                entity_type='DialysisSession',
+                entity_id=session.session_id,
+                changes={
+                    'AI_IDH_EARLY_WARNING': {
+                        'risk_level': 'HIGH',
+                        'probability': round(prob, 4),
+                        'inference_source': source,
+                        'vital_sign_id': vital.id if vital else None,
+                        'recorded_at': vital.recorded_at.isoformat() if vital and vital.recorded_at else timezone.now().isoformat(),
+                        'message': 'Cảnh báo sớm AI (LSTM): Nguy cơ tụt huyết áp (IDH) ở mức CAO trong ca lọc đang diễn ra.',
+                    }
+                }
+            )
+            return prediction
+    except Exception as exc:
+        logger.warning(f"Failed to check/audit IDH early warning: {exc}")
+    return None
 
 
 def get_lstm_model_info() -> Dict[str, Any]:

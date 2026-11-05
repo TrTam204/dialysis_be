@@ -20,6 +20,7 @@ from core.models import (
     DialysisSession,
     Patient,
     VitalSign,
+    AuditLog,
 )
 
 
@@ -165,7 +166,7 @@ class AIBridgeTests(APITestCase):
         self.assertFalse(response.data['is_idh_predicted'])
         self.assertFalse(response.data['is_padded'])
         self.assertEqual(response.data['recorded_vitals_count'], 5)
-        self.assertIn(response.data['inference_source'], {'FASTAPI_MICROSERVICE', 'LOCAL_LSTM_ENGINE'})
+        self.assertIn(response.data['inference_source'], {'FASTAPI_MICROSERVICE', 'LOCAL_LSTM_ENGINE', 'LOCAL_PYTORCH_FALLBACK'})
 
     def test_04_dropping_sbp_trajectory_triggers_high_risk_alert(self):
         """Sharply dropping SBP (e.g. 130 -> 110 -> 92 -> 84) must trigger HIGH risk alert."""
@@ -281,3 +282,118 @@ class AIBridgeTests(APITestCase):
         self.client.force_authenticate(user=nurse_other)
         response = self.client.get(f'/api/sessions/{session.session_id}/idh-prediction/')
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_08_vital_sign_create_triggers_prediction_and_returns_payload_and_latency(self):
+        """
+        Verify that session with vitals returns round_trip_latency_ms, service_url,
+        and input_window_payload containing 3 steps with 8 dynamic features (Mục 2.7 & Mục 3.6 Đề cương).
+        """
+        session = DialysisSession.objects.create(
+            session_id='SS-AIB-WEEK12-01',
+            patient=self.patient,
+            machine=self.machine,
+            scheduled_start=self.now - timedelta(hours=2),
+            scheduled_end=self.now + timedelta(hours=2),
+            actual_start=self.now - timedelta(hours=2),
+            status=DialysisSession.Status.IN_PROGRESS,
+            uf_target=3.0,
+        )
+
+        # Create 3 vital signs
+        for i, sbp in enumerate([130.0, 125.0, 118.0]):
+            VitalSign.objects.create(
+                session=session,
+                recorded_by=self.doctor,
+                recorded_at=self.now - timedelta(minutes=(3 - i) * 30),
+                systolic_bp=sbp,
+                diastolic_bp=80.0,
+                heart_rate=75.0,
+            )
+
+        self.client.force_authenticate(user=self.doctor)
+        response = self.client.get(f'/api/sessions/{session.session_id}/idh-prediction/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['has_prediction'])
+        self.assertIn('round_trip_latency_ms', response.data)
+        self.assertGreaterEqual(response.data['round_trip_latency_ms'], 0.0)
+        self.assertIn('service_url', response.data)
+        self.assertIn('input_window_payload', response.data)
+
+        payload_window = response.data['input_window_payload']
+        self.assertEqual(len(payload_window), 3)
+
+        # Verify all 8 dynamic features are present
+        first_step = payload_window[0]
+        for key in ['step', 'systolic_bp', 'diastolic_bp', 'map', 'sbp_drop_from_baseline',
+                    'heart_rate', 'ufr_ml_kg_h', 'cumulative_uf_pct', 'time_elapsed_min']:
+            self.assertIn(key, first_step, f"Feature {key} missing in input_window_payload")
+
+    def test_09_high_risk_vital_creation_creates_audit_log_early_warning(self):
+        """
+        Verify that adding a vital sign that pushes IDH prediction into HIGH risk
+        automatically creates an AuditLog entry with AI_IDH_EARLY_WARNING.
+        """
+        session = DialysisSession.objects.create(
+            session_id='SS-AIB-WEEK12-HIGH',
+            patient=self.patient,
+            machine=self.machine,
+            assigned_nurse=self.nurse,
+            scheduled_start=self.now - timedelta(hours=2),
+            scheduled_end=self.now + timedelta(hours=2),
+            actual_start=self.now - timedelta(hours=2),
+            status=DialysisSession.Status.IN_PROGRESS,
+            uf_target=4.5,
+        )
+
+        # Baseline vitals
+        VitalSign.objects.create(
+            session=session,
+            recorded_by=self.nurse,
+            recorded_at=self.now - timedelta(minutes=60),
+            systolic_bp=140.0,
+            diastolic_bp=85.0,
+            heart_rate=72.0,
+        )
+        VitalSign.objects.create(
+            session=session,
+            recorded_by=self.nurse,
+            recorded_at=self.now - timedelta(minutes=30),
+            systolic_bp=110.0,
+            diastolic_bp=70.0,
+            heart_rate=88.0,
+        )
+
+        # New vital sign that triggers severe drop to 82 mmHg
+        self.client.force_authenticate(user=self.nurse)
+        resp = self.client.post(
+            f'/api/sessions/{session.session_id}/vitals/',
+            {
+                'recorded_at': self.now.isoformat(),
+                'systolic_bp': 82.0,
+                'diastolic_bp': 52.0,
+                'heart_rate': 105.0,
+                'notes': 'Bệnh nhân có dấu hiệu choáng váng',
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+        # Check AuditLog
+        audit_entries = AuditLog.objects.filter(
+            entity_type='DialysisSession',
+            entity_id=session.session_id,
+        )
+        self.assertTrue(audit_entries.exists(), "AuditLog entry for DialysisSession must be created")
+
+        warning_entry = None
+        for entry in audit_entries:
+            if 'AI_IDH_EARLY_WARNING' in entry.changes:
+                warning_entry = entry
+                break
+
+        self.assertIsNotNone(warning_entry, "AuditLog changes must include AI_IDH_EARLY_WARNING")
+        warning_data = warning_entry.changes['AI_IDH_EARLY_WARNING']
+        self.assertEqual(warning_data['risk_level'], 'HIGH')
+        self.assertGreaterEqual(warning_data['probability'], 0.70)
+        self.assertIn('inference_source', warning_data)

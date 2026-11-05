@@ -44,6 +44,7 @@ class PredictIDHResponse(BaseModel):
     contributing_factors: List[str]
     clinical_recommendations: List[str]
     sequence_length_received: int
+    fastapi_inference_ms: Optional[float] = Field(None, description="Internal model inference execution time at FastAPI microservice (ms)")
 
 
 class MetricSet(BaseModel):

@@ -133,6 +133,8 @@ async def predict_idh(request: PredictIDHRequest):
     # Convert Pydantic models to dicts
     vitals_dicts = [step.model_dump() for step in request.vitals_sequence]
 
+    import time
+    t_start = time.perf_counter()
     try:
         prediction_result = pipe.predict_sequence(
             vitals_list=vitals_dicts,
@@ -144,6 +146,7 @@ async def predict_idh(request: PredictIDHRequest):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Inference error: {str(exc)}",
         )
+    fastapi_ms = round((time.perf_counter() - t_start) * 1000.0, 2)
 
     return PredictIDHResponse(
         prediction_id=str(uuid.uuid4()),
@@ -156,6 +159,7 @@ async def predict_idh(request: PredictIDHRequest):
         contributing_factors=prediction_result['contributing_factors'],
         clinical_recommendations=prediction_result['clinical_recommendations'],
         sequence_length_received=prediction_result['sequence_length_received'],
+        fastapi_inference_ms=fastapi_ms,
     )
 
 

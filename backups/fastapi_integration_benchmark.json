@@ -1,0 +1,144 @@
+{
+  "benchmark_metadata": {
+    "title": "Django Core <-> FastAPI AI Microservice Integration Benchmark",
+    "outline_reference": "Mục 2.7 & Mục 3.6 Đề cương Đồ án Tốt nghiệp",
+    "executed_at": "2026-11-05 11:58:49",
+    "target_service": "http://127.0.0.1:8001/predict-idh",
+    "total_requests": 50,
+    "concurrency": 1,
+    "network_protocol": "HTTP/1.1 REST (JSON)"
+  },
+  "performance_metrics": {
+    "success_rate_pct": 100.0,
+    "avg_fastapi_inference_ms": 2.31,
+    "min_fastapi_inference_ms": 0.74,
+    "max_fastapi_inference_ms": 67.51,
+    "avg_round_trip_ms": 5.16,
+    "min_round_trip_ms": 2.43,
+    "max_round_trip_ms": 92.57,
+    "p95_round_trip_ms": 4.12,
+    "fallback_recovery_latency_ms": 7.88
+  },
+  "scenario_summary": {
+    "SS_INP_HIGH_01": {
+      "name": "Kịch bản Nguy cơ Cao (IDH High Risk - Huyết áp tụt dốc, UFR cao)",
+      "expected_risk": "HIGH",
+      "verified_risk": "HIGH",
+      "verified_probability": 0.9995
+    },
+    "SS_INP_MED_02": {
+      "name": "Kịch bản Nguy cơ Trung bình (IDH Medium Risk - Dao động HA vừa phải)",
+      "expected_risk": "MEDIUM",
+      "verified_risk": "HIGH",
+      "verified_probability": 0.9757
+    },
+    "SS_INP_LOW_03": {
+      "name": "Kịch bản Nguy cơ Thấp (IDH Low Risk - Huyết áp và sinh hiệu ổn định)",
+      "expected_risk": "LOW",
+      "verified_risk": "LOW",
+      "verified_probability": 0.0
+    }
+  },
+  "sample_iteration_logs": [
+    {
+      "iteration": 1,
+      "scenario": "SS_INP_HIGH_01",
+      "risk_level": "HIGH",
+      "risk_probability": 0.9995,
+      "is_idh_predicted": true,
+      "round_trip_latency_ms": 92.57,
+      "fastapi_inference_ms": 67.51,
+      "status": "SUCCESS"
+    },
+    {
+      "iteration": 2,
+      "scenario": "SS_INP_MED_02",
+      "risk_level": "HIGH",
+      "risk_probability": 0.9757,
+      "is_idh_predicted": true,
+      "round_trip_latency_ms": 3.04,
+      "fastapi_inference_ms": 0.88,
+      "status": "SUCCESS"
+    },
+    {
+      "iteration": 3,
+      "scenario": "SS_INP_LOW_03",
+      "risk_level": "LOW",
+      "risk_probability": 0.0,
+      "is_idh_predicted": false,
+      "round_trip_latency_ms": 3.85,
+      "fastapi_inference_ms": 1.02,
+      "status": "SUCCESS"
+    },
+    {
+      "iteration": 4,
+      "scenario": "SS_INP_HIGH_01",
+      "risk_level": "HIGH",
+      "risk_probability": 0.9995,
+      "is_idh_predicted": true,
+      "round_trip_latency_ms": 2.79,
+      "fastapi_inference_ms": 0.74,
+      "status": "SUCCESS"
+    },
+    {
+      "iteration": 5,
+      "scenario": "SS_INP_MED_02",
+      "risk_level": "HIGH",
+      "risk_probability": 0.9757,
+      "is_idh_predicted": true,
+      "round_trip_latency_ms": 4.13,
+      "fastapi_inference_ms": 1.42,
+      "status": "SUCCESS"
+    },
+    {
+      "iteration": 6,
+      "scenario": "SS_INP_LOW_03",
+      "risk_level": "LOW",
+      "risk_probability": 0.0,
+      "is_idh_predicted": false,
+      "round_trip_latency_ms": 2.77,
+      "fastapi_inference_ms": 0.83,
+      "status": "SUCCESS"
+    },
+    {
+      "iteration": 7,
+      "scenario": "SS_INP_HIGH_01",
+      "risk_level": "HIGH",
+      "risk_probability": 0.9995,
+      "is_idh_predicted": true,
+      "round_trip_latency_ms": 3.89,
+      "fastapi_inference_ms": 1.07,
+      "status": "SUCCESS"
+    },
+    {
+      "iteration": 8,
+      "scenario": "SS_INP_MED_02",
+      "risk_level": "HIGH",
+      "risk_probability": 0.9757,
+      "is_idh_predicted": true,
+      "round_trip_latency_ms": 2.8,
+      "fastapi_inference_ms": 0.76,
+      "status": "SUCCESS"
+    },
+    {
+      "iteration": 9,
+      "scenario": "SS_INP_LOW_03",
+      "risk_level": "LOW",
+      "risk_probability": 0.0,
+      "is_idh_predicted": false,
+      "round_trip_latency_ms": 3.93,
+      "fastapi_inference_ms": 1.0,
+      "status": "SUCCESS"
+    },
+    {
+      "iteration": 10,
+      "scenario": "SS_INP_HIGH_01",
+      "risk_level": "HIGH",
+      "risk_probability": 0.9995,
+      "is_idh_predicted": true,
+      "round_trip_latency_ms": 2.83,
+      "fastapi_inference_ms": 0.77,
+      "status": "SUCCESS"
+    }
+  ]
+}

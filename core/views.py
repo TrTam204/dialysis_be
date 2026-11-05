@@ -47,7 +47,7 @@ from .serializers import (
     MedicalMessageSerializer,
 )
 from .kmeans_service import KMeansClusteringService
-from .ai_bridge import predict_idh_for_session, get_lstm_model_info
+from .ai_bridge import predict_idh_for_session, get_lstm_model_info, check_and_audit_idh_early_warning
 from .services import (
     approve_schedule_plan,
     dashboard_dialysis_stats,
@@ -255,6 +255,7 @@ class DialysisSessionViewSet(BaseRoleAwareViewSet):
         with transaction.atomic():
             vital = serializer.save(session=session, recorded_by=request.user)
             record_audit_log(actor=request.user, action=AuditLog.Action.CREATE, instance=vital)
+            check_and_audit_idh_early_warning(session=session, vital=vital, actor=request.user)
         return Response(serializer.data, status=201)
 
     @action(detail=True, methods=['get'], url_path='idh-prediction')
@@ -411,7 +412,16 @@ class VitalSignViewSet(BaseRoleAwareViewSet):
         return super().get_permissions()
 
     def perform_create(self, serializer):
-        serializer.save(recorded_by=self.request.user)
+        vital = serializer.save(recorded_by=self.request.user)
+        session = getattr(vital, 'session', None)
+        if session:
+            check_and_audit_idh_early_warning(session=session, vital=vital, actor=self.request.user)
+
+    def perform_update(self, serializer):
+        vital = serializer.save()
+        session = getattr(vital, 'session', None)
+        if session:
+            check_and_audit_idh_early_warning(session=session, vital=vital, actor=self.request.user)
 
 
 # ---------------------------------------------------------------------------

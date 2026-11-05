@@ -132,3 +132,4 @@ Khi dịch vụ đang chạy trên cổng `8001`, bạn có thể truy cập tr�
 python -m unittest idh_ai_service/test_fastapi_lstm.py
 ```
 Toàn bộ 8 ca kiểm thử bao phủ tính toàn vẹn của mô hình, chuẩn hóa dữ liệu, xác thực Pydantic và luồng suy luận FastAPI.
+
