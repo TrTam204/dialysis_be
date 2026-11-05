@@ -57,6 +57,22 @@ class MetricSet(BaseModel):
     sample_count: int
 
 
+class HyperparameterExperiment(BaseModel):
+    """Result of a single hyperparameter configuration in grid search."""
+    exp_id: str = Field(..., description="Experiment Identifier")
+    num_layers: int = Field(..., description="Number of stacked LSTM layers")
+    hidden_dim: int = Field(..., description="Hidden dimension size per layer")
+    dropout: float = Field(..., description="Dropout rate")
+    learning_rate: float = Field(..., description="Initial learning rate for Adam optimizer")
+    batch_size: int = Field(..., description="Mini-batch size")
+    val_loss: float = Field(..., description="Validation Loss")
+    val_accuracy: float = Field(..., description="Validation Accuracy")
+    val_f1: float = Field(..., description="Validation F1-score")
+    val_roc_auc: float = Field(..., description="Validation ROC-AUC")
+    selected: bool = Field(False, description="Whether this experiment was selected as optimal")
+    note: str = Field("", description="Clinical and technical evaluation note")
+
+
 class ModelInfoResponse(BaseModel):
     """Model architecture and evaluation metrics report."""
     model_name: str
@@ -69,6 +85,7 @@ class ModelInfoResponse(BaseModel):
     metrics: Dict[str, MetricSet]
     training_history: Optional[List[Dict[str, Any]]] = None
     training_hyperparameters: Dict[str, Any]
+    hyperparameter_tuning: Optional[List[HyperparameterExperiment]] = None
 
 
 class HealthResponse(BaseModel):
@@ -78,3 +95,9 @@ class HealthResponse(BaseModel):
     version: str
     device: str
     timestamp: str
+
+
+# Syllabus Aliases for Microservice Schemas
+IDHPredictionRequest = PredictIDHRequest
+IDHPredictionResponse = PredictIDHResponse
+VitalStepInput = VitalSignTimeStep

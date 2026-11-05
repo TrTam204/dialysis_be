@@ -74,6 +74,13 @@ class TestIDHAIService(unittest.TestCase):
         self.assertIn("training_history", data)
         self.assertGreater(len(data["training_history"]), 0)
 
+        # Check that hyperparameter tuning grid search experiments exist
+        self.assertIn("hyperparameter_tuning", data)
+        self.assertGreater(len(data["hyperparameter_tuning"]), 0)
+        selected_configs = [c for c in data["hyperparameter_tuning"] if c.get("selected")]
+        self.assertEqual(len(selected_configs), 1)
+        self.assertEqual(selected_configs[0]["exp_id"], "EXP-04")
+
     def test_06_fastapi_predict_idh_stable_trajectory(self):
         """Verify POST /predict-idh on stable vital signs trajectory yields LOW risk."""
         payload = {
