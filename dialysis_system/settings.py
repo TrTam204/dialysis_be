@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 import os
+import sys
 from datetime import timedelta
 from pathlib import Path
 
@@ -197,3 +198,19 @@ if pg_bin_path:
 
 # AI Microservice URL (FastAPI LSTM IDH prediction service)
 FASTAPI_IDH_SERVICE_URL = os.getenv('FASTAPI_IDH_SERVICE_URL', 'http://127.0.0.1:8001')
+
+# Email / Gmail SMTP Configuration
+EMAIL_BACKEND = os.getenv('EMAIL_BACKEND', 'django.core.mail.backends.smtp.EmailBackend')
+EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp.gmail.com')
+EMAIL_PORT = int(os.getenv('EMAIL_PORT', '587'))
+EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'True').lower() in ('true', '1')
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', 'admin.ttam.dialysis@gmail.com')
+_raw_email_pwd = os.getenv('EMAIL_HOST_PASSWORD', 'khxuzjwrsuimyfes')
+EMAIL_HOST_PASSWORD = _raw_email_pwd.replace(' ', '') if _raw_email_pwd else ''
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', 'Trung Tâm Lọc Máu LocMau <admin.ttam.dialysis@gmail.com>')
+EMAIL_APP_NAME = os.getenv('EMAIL_APP_NAME', 'Dialysis Website TTam')
+
+# Fast in-memory backend for unit tests
+if 'test' in sys.argv:
+    EMAIL_BACKEND = 'django.core.mail.backends.locmem.EmailBackend'
+

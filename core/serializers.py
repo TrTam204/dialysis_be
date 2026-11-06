@@ -53,7 +53,19 @@ def _user_display(user):
 class DepartmentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Department
-        fields = ['id', 'name', 'code', 'description', 'is_active', 'created_at', 'updated_at']
+        fields = [
+            'id',
+            'name',
+            'code',
+            'description',
+            'is_active',
+            'head_doctor_name',
+            'location_floor',
+            'hotline_phone',
+            'max_machine_capacity',
+            'created_at',
+            'updated_at',
+        ]
         read_only_fields = ['id', 'created_at', 'updated_at']
 
 
@@ -74,6 +86,14 @@ class CustomUserSerializer(serializers.ModelSerializer):
             'phone_number',
             'department',
             'department_name',
+            'employee_code',
+            'gender',
+            'date_of_birth',
+            'citizen_id',
+            'address',
+            'degree_title',
+            'license_number',
+            'specialization',
             'is_active',
             'avatar_url',
             'password',
@@ -142,6 +162,14 @@ class PatientSerializer(serializers.ModelSerializer):
             'department_name',
             'preferred_shift',
             'treatment_pattern',
+            'citizen_id',
+            'health_insurance_number',
+            'permanent_address',
+            'blood_type',
+            'emergency_contact_name',
+            'emergency_contact_relationship',
+            'emergency_contact_phone',
+            'vascular_access_type',
             'created_at',
             'updated_at',
         ]
@@ -315,6 +343,11 @@ class DialysisSessionSerializer(serializers.ModelSerializer):
             'post_weight',
             'uf_target',
             'uf_actual',
+            'blood_flow_rate',
+            'dialysate_flow_rate',
+            'dialysate_temperature',
+            'dialyzer_type',
+            'anticoagulant_type',
             'clinical_notes',
             'pre_dialysis_bp',
             'during_dialysis_bp',
@@ -362,6 +395,13 @@ class BloodSampleSerializer(serializers.ModelSerializer):
             'collection_date',
             'hemoglobin_level',
             'potassium_level',
+            'urea_level',
+            'creatinine_level',
+            'sodium_level',
+            'calcium_level',
+            'phosphorus_level',
+            'albumin_level',
+            'kt_v',
             'notes',
             'created_by',
             'created_by_name',

@@ -30,11 +30,11 @@ def logout_view(request):
 @authentication_classes([])
 @permission_classes([AllowAny])
 def forgot_password_view(request):
-    return forgot_password(request.data.get('email'))
+    return forgot_password(request.data.get('email'), request=request)
 
 
 @api_view(['POST'])
 @authentication_classes([])
 @permission_classes([AllowAny])
 def reset_password_view(request):
-    return reset_password(request.data.get('email'), request.data.get('otp'), request.data.get('password'))
+    return reset_password(request.data.get('email'), request.data.get('otp'), request.data.get('password'), request=request)

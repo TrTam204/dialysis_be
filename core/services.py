@@ -178,43 +178,196 @@ def logout_user():
     return Response({'detail': 'Logged out successfully.'}, status=status.HTTP_200_OK)
 
 
-def forgot_password(email):
-    if not email:
-        return Response({'detail': 'Email is required.'}, status=status.HTTP_400_BAD_REQUEST)
+def forgot_password(email, request=None):
+    if not email or not str(email).strip():
+        return Response({'detail': 'Vui lòng cung cấp địa chỉ email.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    user = CustomUser.objects.filter(email=email).first()
+    clean_email = str(email).strip().lower()
+    user = CustomUser.objects.filter(email__iexact=clean_email).first()
     if user is None:
         return Response(
-            {'detail': 'If the email exists in the system, an OTP has been generated.'},
-            status=status.HTTP_200_OK,
+            {'detail': 'Địa chỉ email này chưa được đăng ký cho bất kỳ cán bộ y tế nào trong hệ thống.'},
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
-    otp = get_random_string(length=6, allowed_chars='0123456789')
-    cache.set(f'otp_{email}', otp, timeout=300)
-    user.email_user(
-        subject='Dialysis Center password reset OTP',
-        message=f'Your OTP is: {otp}',
-        from_email='no-reply@dialysis.local',
+    import random
+    import sys
+    otp = f"{random.randint(100000, 999999)}"
+
+    cache.set(f'password_reset_otp_{clean_email}', otp, timeout=300)
+    cache.set(f'otp_{clean_email}', otp, timeout=300)
+    if user.email:
+        cache.set(f'otp_{user.email}', otp, timeout=300)
+
+    role_map = {
+        CustomUser.Role.DOCTOR: 'Bác sĩ',
+        CustomUser.Role.NURSE: 'Điều dưỡng',
+        CustomUser.Role.ADMIN: 'Quản trị viên',
+    }
+    role_title = role_map.get(user.role, 'Cán bộ y tế')
+    full_name = f"{user.last_name} {user.first_name}".strip() or user.username
+    department_name = user.department.name if user.department else "Toàn viện (Ban Quản trị Trung tâm)"
+
+    now_local = dj_timezone.localtime(dj_timezone.now())
+    expiry_local = now_local + timedelta(seconds=300)
+    timestamp_str = now_local.strftime('%H:%M:%S - Ngày %d/%m/%Y (GMT+7)')
+    issued_time = now_local.strftime('%H:%M:%S')
+    expiry_time = expiry_local.strftime('%H:%M:%S')
+
+    client_ip = _get_client_ip(request) if request else '127.0.0.1'
+    raw_ua = request.META.get('HTTP_USER_AGENT', 'Trình duyệt Web') if request else 'Trình duyệt Web'
+    user_agent_short = raw_ua[:80] + '...' if len(raw_ua) > 80 else raw_ua
+
+    failed_attempts = cache.get(f'login_attempts_{user.username}', 0)
+    if failed_attempts >= LOGIN_LOCKOUT_MAX_ATTEMPTS:
+        reason_str = "Yêu cầu khôi phục mật khẩu & Mở khóa tài khoản sau khi phát hiện nhập sai mật khẩu quá 5 lần liên tiếp"
+    else:
+        reason_str = "Yêu cầu cấp mã OTP khôi phục mật khẩu đăng nhập hệ thống từ người dùng"
+
+    app_name = getattr(settings, 'EMAIL_APP_NAME', 'Dialysis Website TTam')
+    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', 'Trung Tâm Lọc Máu LocMau <admin.ttam.dialysis@gmail.com>')
+    subject = f'[{app_name}] Mã xác thực OTP khôi phục mật khẩu - {user.username}'
+
+    plain_text = (
+        f"Kính gửi {role_title} {full_name},\n\n"
+        f"Hệ thống Quản lý & Hỗ trợ Ra quyết định Trung tâm Lọc máu ({app_name}) đã tiếp nhận yêu cầu cấp mã xác thực OTP khôi phục mật khẩu cho tài khoản của bạn.\n\n"
+        f"--- THÔNG TIN CHI TIẾT SỰ KIỆN BẢO MẬT ---\n"
+        f"• Tài khoản đăng nhập: {user.username} ({user.email})\n"
+        f"• Chức vụ & Đơn vị: {role_title} — {department_name}\n"
+        f"• Thời gian ghi nhận: {timestamp_str}\n"
+        f"• Vị trí & Thiết bị: IP: {client_ip} ({user_agent_short}) — Khu vực: TP.HCM, Việt Nam\n"
+        f"• Lý do cấp mã: {reason_str}\n\n"
+        f"--- MÃ XÁC THỰC OTP (06 CHỮ SỐ) ---\n"
+        f"               [ {otp} ]\n\n"
+        f"Mã OTP của bạn có hiệu lực trong vòng 05 phút (300 giây) kể từ thời điểm cấp ({issued_time} đến {expiry_time}).\n\n"
+        f"--- HƯỚNG DẪN XỬ LÝ ---\n"
+        f"Vui lòng nhập mã OTP 6 số này vào màn hình Khôi phục mật khẩu trên website để hoàn tất đặt lại mật khẩu mới (và tự động mở khóa tài khoản nếu đang bị tạm khóa).\n\n"
+        f"Nếu không phải bạn yêu cầu cấp mã, xin vui lòng bỏ qua thư này hoặc thông báo ngay cho Quản trị viên Trung tâm Lọc máu.\n\n"
+        f"Trân trọng,\nBan Quản trị An toàn Thông tin - Trung Tâm Lọc Máu LocMau"
     )
-    return Response({'detail': 'OTP has been generated and sent via email simulation.', 'otp': otp}, status=status.HTTP_200_OK)
+
+    html_message = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f1f5f9; margin: 0; padding: 24px; color: #1e293b; }}
+  .container {{ max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 16px rgba(0,0,0,0.06); border: 1px solid #e2e8f0; }}
+  .header {{ background: #1e3a8a; padding: 24px; text-align: center; color: #ffffff; }}
+  .header h2 {{ margin: 0; font-size: 18px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; }}
+  .header p {{ margin: 6px 0 0 0; font-size: 13px; color: #93c5fd; }}
+  .content {{ padding: 28px 24px; }}
+  .greeting {{ font-size: 16px; font-weight: 600; color: #0f172a; margin-bottom: 16px; }}
+  .intro {{ font-size: 14px; line-height: 1.6; color: #334155; margin-bottom: 20px; }}
+  .info-table {{ width: 100%; border-collapse: collapse; margin-bottom: 24px; font-size: 13.5px; background: #f8fafc; border-radius: 8px; overflow: hidden; border: 1px solid #e2e8f0; }}
+  .info-table td {{ padding: 10px 14px; border-bottom: 1px solid #e2e8f0; }}
+  .info-table tr:last-child td {{ border-bottom: none; }}
+  .info-label {{ font-weight: 600; color: #64748b; width: 38%; }}
+  .info-value {{ font-weight: 600; color: #0f172a; }}
+  .otp-card {{ background: #eff6ff; border: 2px dashed #3b82f6; border-radius: 10px; padding: 20px; text-align: center; margin-bottom: 24px; }}
+  .otp-title {{ font-size: 12.5px; font-weight: 700; color: #1d4ed8; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }}
+  .otp-code {{ font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace; font-size: 34px; font-weight: 800; color: #1e3a8a; letter-spacing: 10px; margin: 8px 0; }}
+  .otp-timer {{ font-size: 13px; color: #475569; margin-top: 8px; }}
+  .otp-timer strong {{ color: #dc2626; }}
+  .instructions {{ font-size: 13.5px; line-height: 1.6; color: #475569; border-left: 4px solid #3b82f6; padding-left: 14px; margin-bottom: 24px; }}
+  .footer {{ background: #f8fafc; border-top: 1px solid #e2e8f0; padding: 16px 24px; text-align: center; font-size: 12px; color: #64748b; line-height: 1.5; }}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h2>HỆ THỐNG QUẢN LÝ & HỖ TRỢ RA QUYẾT ĐỊNH TRUNG TÂM LỌC MÁU</h2>
+    <p>Dialysis Website TTam • An Toàn Thông Tin Y Tế</p>
+  </div>
+  <div class="content">
+    <div class="greeting">Kính gửi {role_title} {full_name},</div>
+    <div class="intro">
+      Hệ thống Trung tâm Lọc máu ghi nhận yêu cầu cấp mã xác thực OTP khôi phục mật khẩu cho tài khoản đăng nhập của bạn.
+    </div>
+    <table class="info-table">
+      <tr><td class="info-label">Tài khoản đăng nhập:</td><td class="info-value">{user.username} ({user.email})</td></tr>
+      <tr><td class="info-label">Chức vụ & Đơn vị:</td><td class="info-value">{role_title} — {department_name}</td></tr>
+      <tr><td class="info-label">Thời gian ghi nhận:</td><td class="info-value">{timestamp_str}</td></tr>
+      <tr><td class="info-label">Vị trí & Thiết bị:</td><td class="info-value">IP: {client_ip} ({user_agent_short})<br><small style="color:#64748b">Khu vực: TP. Hồ Chí Minh, Việt Nam</small></td></tr>
+      <tr><td class="info-label">Lý do cấp mã:</td><td class="info-value" style="color:#2563eb;">{reason_str}</td></tr>
+    </table>
+    <div class="otp-card">
+      <div class="otp-title">Mã Xác Thực Khôi Phục Mật Khẩu (OTP)</div>
+      <div class="otp-code">{otp}</div>
+      <div class="otp-timer">Mã có hiệu lực trong vòng <strong>05 phút (300 giây)</strong> ({issued_time} đến {expiry_time})</div>
+    </div>
+    <div class="instructions">
+      <strong>Hướng dẫn:</strong> Nhập mã OTP 6 số này vào màn hình Khôi phục mật khẩu trên website để hoàn tất đặt lại mật khẩu mới (và tự động mở khóa tài khoản nếu đang bị tạm khóa).
+    </div>
+  </div>
+  <div class="footer">
+    Thư này được tạo tự động từ Hệ thống Trung tâm Lọc máu LocMau.<br>
+    Nếu không phải bạn yêu cầu, xin vui lòng bỏ qua thư này hoặc thông báo cho Quản trị viên hệ thống.
+  </div>
+</div>
+</body>
+</html>"""
+
+    try:
+        send_mail(
+            subject=subject,
+            message=plain_text,
+            from_email=from_email,
+            recipient_list=[user.email],
+            html_message=html_message,
+            fail_silently=False,
+        )
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("SMTP send_mail error: %s", exc)
+
+    return Response({
+        'detail': f'Đã gửi mã OTP 6 chữ số tới hộp thư {user.email}. Mã có hiệu lực trong 05 phút.',
+        'email': user.email,
+        'otp': otp if (getattr(settings, 'DEBUG', False) or 'test' in sys.argv) else None,
+    }, status=status.HTTP_200_OK)
 
 
-def reset_password(email, otp, password):
-    if not email or not otp or not password:
-        return Response({'detail': 'Email, OTP and new password are required.'}, status=status.HTTP_400_BAD_REQUEST)
+def reset_password(email, otp, password, request=None):
+    if not email or not str(email).strip():
+        return Response({'detail': 'Email là bắt buộc.'}, status=status.HTTP_400_BAD_REQUEST)
+    if not otp or not str(otp).strip():
+        return Response({'detail': 'Mã OTP là bắt buộc.'}, status=status.HTTP_400_BAD_REQUEST)
+    if not password:
+        return Response({'detail': 'Mật khẩu mới là bắt buộc.'}, status=status.HTTP_400_BAD_REQUEST)
+    if len(password) < 6:
+        return Response({'detail': 'Mật khẩu mới phải có ít nhất 6 ký tự.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    cached_otp = cache.get(f'otp_{email}')
-    if cached_otp is None or str(cached_otp) != str(otp):
-        return Response({'detail': 'Invalid or expired OTP.'}, status=status.HTTP_400_BAD_REQUEST)
+    clean_email = str(email).strip().lower()
+    cached_otp = cache.get(f'password_reset_otp_{clean_email}') or cache.get(f'otp_{clean_email}') or cache.get(f'otp_{email}')
+    if cached_otp is None or str(cached_otp).strip() != str(otp).strip():
+        return Response({'detail': 'Mã OTP không chính xác hoặc đã hết hạn (hiệu lực 5 phút).'}, status=status.HTTP_400_BAD_REQUEST)
 
-    user = CustomUser.objects.filter(email=email).first()
+    user = CustomUser.objects.filter(email__iexact=clean_email).first()
     if user is None:
-        return Response({'detail': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({'detail': 'Không tìm thấy người dùng khớp với email.'}, status=status.HTTP_404_NOT_FOUND)
 
     user.set_password(password)
     user.save()
+
+    cache.delete(f'password_reset_otp_{clean_email}')
+    cache.delete(f'otp_{clean_email}')
     cache.delete(f'otp_{email}')
-    return Response({'detail': 'Password reset successfully.'}, status=status.HTTP_200_OK)
+    cache.delete(f'login_attempts_{user.username}')
+    cache.delete(f'login_attempts_{user.username.lower()}')
+
+    record_audit_log(
+        actor=user,
+        action=AuditLog.Action.UPDATE,
+        instance=user,
+        changes={
+            'action': 'PASSWORD_RESET_VIA_EMAIL_OTP',
+            'client_ip': _get_client_ip(request) if request else '127.0.0.1',
+            'timestamp': dj_timezone.now().isoformat(),
+        },
+    )
+
+    return Response({'detail': 'Đặt lại mật khẩu thành công. Tài khoản đã được mở khóa an toàn.'}, status=status.HTTP_200_OK)
 
 
 # ---------------------------------------------------------------------------

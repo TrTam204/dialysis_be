@@ -142,3 +142,4 @@ $$\text{is\_idh\_target} = \begin{cases}
   - **Validation Set (15%):** 180 phiên lọc = **1.080 cửa sổ** (Tỷ lệ dương tính IDH: 13.80%)
   - **Test Set (15%):** 180 phiên lọc = **1.080 cửa sổ** (Tỷ lệ dương tính IDH: 13.06%)
 - **Chuẩn hóa StandardScaler:** Bộ scaler chỉ được tính giá trị `mean` và `scale` dựa trên 5.040 cửa sổ của tập Train, sau đó áp dụng biến đổi đóng băng cho tập Validation và Test.
+
